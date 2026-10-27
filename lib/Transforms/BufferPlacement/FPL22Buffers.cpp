@@ -50,33 +50,39 @@ void FPL22BuffersBase::extractResult(BufferPlacement &placement) {
         model->getValue(chVars.signalVars[SignalType::READY].bufPresent) > 0;
 
     PlacementResult result;
+    // A `fast` buffer can accept a new token in the same clock cycle 
+    // as the previous token is emitted. A `slow` buffer needs at least
+    // one cycle in between. 
+
+    // ONE_SLOT_BREAK_DV = opaque fast
+    // ONE_SLOT_BREAK_R = transparent slow
+    // FIFO_BREAK_NONE = transparent fast
+
+    // We don't count ONE_SLOT_BREAK_R towards the number of slots
+    // because it's slow and cannot accept/emit a token every cycle.
+
     // 1. If breaking DV & R:
-    // When numslot = 1, map to ONE_SLOT_BREAK_DVR;
-    // When numslot > 1, map to ONE_SLOT_BREAK_DV + (numslot - 2) *
-    //                            FIFO_BREAK_NONE + ONE_SLOT_BREAK_R.
+    // ONE_SLOT_BREAK_R + ONE_SLOT_BREAK_DV + (numslot - 1) *
+    //                                           FIFO_BREAK_NONE
     //
     // 2. If only breaking DV:
-    // Map to ONE_SLOT_BREAK_DV + (numslot - 1) * FIFO_BREAK_NONE.
+    // ONE_SLOT_BREAK_DV + (numslot - 1) * FIFO_BREAK_NONE.
     //
     // 3. If only breaking R:
-    // Map to ONE_SLOT_BREAK_R + (numslot - 1) * FIFO_BREAK_NONE.
+    // ONE_SLOT_BREAK_R + numslot * FIFO_BREAK_NONE.
     //
     // 4. If breaking none:
-    // Map to numslot * FIFO_BREAK_NONE.
+    // numslot * FIFO_BREAK_NONE.
     if (forceBreakDV && forceBreakR) {
-      if (numSlotsToPlace == 1) {
-        result.numOneSlotDVR = 1;
-      } else {
-        result.numOneSlotDV = 1;
-        result.numFifoNone = numSlotsToPlace - 2;
-        result.numOneSlotR = 1;
-      }
+      result.numOneSlotR = 1;
+      result.numOneSlotDV = 1;
+      result.numFifoNone = numSlotsToPlace - 1;
     } else if (forceBreakDV) {
       result.numOneSlotDV = 1;
       result.numFifoNone = numSlotsToPlace - 1;
     } else if (forceBreakR) {
       result.numOneSlotR = 1;
-      result.numFifoNone = numSlotsToPlace - 1;
+      result.numFifoNone = numSlotsToPlace;
     } else {
       result.numFifoNone = numSlotsToPlace;
     }
