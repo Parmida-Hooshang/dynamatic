@@ -1,5 +1,10 @@
 #!/bin/bash
 
+PYTHON_PATH=$(which python3.12)
+if [ -z "$PYTHON_PATH" ]; then
+    PYTHON_PATH=$(which python3)
+fi
+
 # Kill the whole script on Ctrl+C
 trap "exit" INT
 
@@ -389,6 +394,13 @@ if should_run_cmake ; then
         -DLLVM_TARGETS_TO_BUILD="host" \
         -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
         -DCMAKE_EXPORT_COMPILE_COMMANDS="ON" \
+      -DPython3_EXECUTABLE=$PYTHON_PATH \
+      -DPython3_FIND_STRATEGY=LOCATION \
+      -DPython3_FIND_FRAMEWORK=LAST \
+      -DPython3_ROOT_DIR=$(dirname $(dirname $PYTHON_PATH)) \
+      -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=$(pwd)/../googletest/googletest \
+      -DFETCHCONTENT_SOURCE_DIR_JSON=$(pwd)/../json/json \
+      -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=$(pwd)/../json/json \
         $CMAKE_COMPILERS \
         $CMAKE_DYNAMATIC_BUILD_OPTIMIZATIONS \
         $CMAKE_DYNAMATIC_ENABLE_XLS \

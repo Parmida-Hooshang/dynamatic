@@ -118,6 +118,14 @@ public:
 
     // Check whether we found an optimal solution or reached the time limit
     int stat = model->status;
+    if (stat != CPSolver::OPTIMAL)
+      allModelsOptimal = false;
+    llvm::errs() << "[INFO] MILP (" << writeTo << ") status=" << stat
+                 << " (OPTIMAL=" << CPSolver::OPTIMAL
+                 << ", NONOPTIMAL=" << CPSolver::NONOPTIMAL << ") | overall so far: "
+                 << (allModelsOptimal ? "ALL OPTIMAL" : "AT LEAST ONE NONOPTIMAL")
+                 << "\n";
+
     if (milpStatus)
       *milpStatus = stat;
     if (stat != CPSolver::OPTIMAL && stat != CPSolver::NONOPTIMAL) {
@@ -203,6 +211,10 @@ private:
 
   /// MILP's state, which changes during the object's lifetime.
   State state = State::FAILED_TO_SETUP;
+
+  /// Tracks whether every `MILP<Result>::optimize` call so far in
+  /// this process has returned CPSolver::OPTIMAL
+  inline static bool allModelsOptimal = true;
 
   /// Returns a description of the MILP's current state.
   StringRef getStateMessage() {

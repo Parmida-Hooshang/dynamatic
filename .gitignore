@@ -53,3 +53,7 @@ metals.sbt
 
 # ElasticMiter puts external files in this directory
 /ext
+
+# Local build assets
+/googletest
+/json
