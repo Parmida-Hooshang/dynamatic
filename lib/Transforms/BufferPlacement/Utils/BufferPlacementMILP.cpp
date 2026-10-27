@@ -555,28 +555,37 @@ void BufferPlacementMILP::populateCFDFCThroughputAndOccupancy() {
 
 void BufferPlacementMILP::addChannelTimingConstraints(
     Value channel, SignalType signalType, const TimingModel *bufModel,
-    ArrayRef<BufferingGroup> before, ArrayRef<BufferingGroup> after) {
+    ArrayRef<BufferingGroup> before, ArrayRef<BufferingGroup> after,
+    llvm::function_ref<LinExpr(SignalType)> bufPresentOverride) {
 
   ChannelVars &chVars = vars.channelVars[channel];
   double bigCst = targetPeriod * 10;
 
+  // The buffer-presence term of a signal on the channel is its MILP variable,
+  // unless the caller overrides it.
+  auto getBufPresent = [&](SignalType sig) -> LinExpr {
+    if (bufPresentOverride)
+      return bufPresentOverride(sig);
+    return LinExpr(chVars.signalVars[sig].bufPresent);
+  };
+
   // Sum up conditional delays of buffers before the one that cuts the path
   LinExpr bufsBeforeDelay;
   for (const BufferingGroup &group : before)
-    bufsBeforeDelay += chVars.signalVars[group.getRefSignal()].bufPresent *
+    bufsBeforeDelay += getBufPresent(group.getRefSignal()) *
                        group.getCombinationalDelay(channel, signalType);
 
   // Sum up conditional delays of buffers after the one that cuts the path
   LinExpr bufsAfterDelay;
   for (const BufferingGroup &group : after)
-    bufsAfterDelay += chVars.signalVars[group.getRefSignal()].bufPresent *
+    bufsAfterDelay += getBufPresent(group.getRefSignal()) *
                       group.getCombinationalDelay(channel, signalType);
 
   ChannelBufProps &props = channelProps[channel];
   ChannelSignalVars &signalVars = chVars.signalVars[signalType];
   CPVar &t1 = signalVars.path.tIn;
   CPVar &t2 = signalVars.path.tOut;
-  CPVar &bufPresent = signalVars.bufPresent;
+  LinExpr bufPresent = getBufPresent(signalType);
   auto [inBufDelay, outBufDelay] = getPortDelays(channel, signalType, bufModel);
 
   // Arrival time at channel's output must be lower than target clock period

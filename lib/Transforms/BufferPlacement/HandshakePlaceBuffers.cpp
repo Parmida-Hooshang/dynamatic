@@ -685,10 +685,17 @@ LogicalResult HandshakePlaceBuffersPass::solveBufferPlacementMILP(
       writeTo = dumpDir + sep + funcName + "-out-of-cycle";
     }
 
-    // Solve last MILP on channels/units that are not part of any CFDFC
-    fpl22::OutOfCycleBuffers milp(solverKind, timeout, info, timingDB, targetCP,
-                                  writeTo);
-    return milp.solve(placement, calculatePathDelays);
+    // Solve global MILP, viewing all channels/units
+    if (dumpMILPModels) {
+      writeTo = dumpDir + sep + funcName + "-global";
+    }
+    fpl22::NonCFDFCBuffers globalMILP(
+        solverKind, timeout, info, timingDB, targetCP, placement,
+        writeTo);
+    if (failed(globalMILP.solve(placement, calculatePathDelays)))
+      return failure();
+
+    return success();
   }
 
   if (algorithm == FPGA24) {

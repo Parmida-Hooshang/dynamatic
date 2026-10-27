@@ -106,30 +106,41 @@ private:
   void setup();
 };
 
-/// This MILP operates on the channels and units that are outside of all CFDFCs
-/// identified in a Handshake function. It takes into account all timing domains
-/// of dataflow circuits (data, valid, ready) to derive an optimal buffer
+/// This MILP enforces path constraints on the whole circuit. This post-processing
+/// is necessary because CFDFCUnionBuffers ignores channels that are outside 
+/// of all CFDFCs. This class considers all channels, even those inside CFDFCs, 
+/// but only introduces new buffers on channels outside all CFDFCs to preserve
+/// the throughput optimized by CFDFCUnionBuffers. It takes into account all timing
+/// domains of dataflow circuits (data, valid, ready) to derive an optimal buffer
 /// placement. It creates
 /// 1. custom channel constraints derived from channel-specific buffering
 ///    properties
 /// 2. path constraints on all timing domains (including mixed-domain
 ///    connections within units)
 /// 3. elasticity constraints
-/// 5. a maximixation objective that penalizes the placement of many large
+/// 4. a maximization objective that penalizes the placement of many large
 ///    buffers in the circuit
-class OutOfCycleBuffers : public FPL22BuffersBase {
+class NonCFDFCBuffers : public FPL22BuffersBase {
 public:
-  /// Setups the entire MILP that buffers the input dataflow circuit for the
+  /// Sets up the entire MILP that buffers the input dataflow circuit for the
   /// target clock period, after which (absent errors) it is ready for
   /// optimization. If a channel's buffering properties are provably
   /// unsatisfiable, the MILP will not be marked ready for optimization,
-  /// ensuring that further calls to `optimize` fail.
-  OutOfCycleBuffers(CPSolver::SolverKind solverKind, int timeout,
-                    FuncInfo &funcInfo, const TimingDatabase &timingDB,
-                    double targetPeriod, StringRef writeTo);
+  /// ensuring that further calls to `optimize` fail. It also takes 
+  /// prior placements into consideration.
+  NonCFDFCBuffers(CPSolver::SolverKind solverKind, int timeout,
+                             FuncInfo &funcInfo,
+                             const TimingDatabase &timingDB,
+                             double targetPeriod,
+                             const BufferPlacement &priorPlacement,
+                             StringRef writeTo);
 
 private:
-  /// Setups the entire MILP, creating all variables, constraints, and setting
+  /// The buffer placement decisions already made by the earlier MILPs,
+  /// so this step only ever adds buffers, never removes them.
+  const BufferPlacement &priorPlacement;
+
+  /// Sets up the entire MILP, creating all variables, constraints, and setting
   /// the system's objective. Called by the constructor in the absence of prior
   /// failures, after which the MILP is ready to be optimized.
   void setup();

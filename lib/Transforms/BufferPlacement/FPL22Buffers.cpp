@@ -290,7 +290,7 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
   for (MixedDomainConstraint &cons : constraints) {
     // The input/output channels must both be inside the CFDFC union
     if (!filter(cons.input.channel) || !filter(cons.output.channel))
-      return;
+      continue;
 
     // Find variables for arrival time at input/output pin
     CPVar &tPinIn = vars.channelVars[cons.input.channel]
@@ -407,17 +407,17 @@ void CFDFCUnionBuffers::setup() {
   markReadyToOptimize();
 }
 
-OutOfCycleBuffers::OutOfCycleBuffers(CPSolver::SolverKind solverKind,
-                                     int timeout, FuncInfo &funcInfo,
-                                     const TimingDatabase &timingDB,
-                                     double targetPeriod, StringRef writeTo)
+NonCFDFCBuffers::NonCFDFCBuffers(
+    CPSolver::SolverKind solverKind, int timeout, FuncInfo &funcInfo,
+    const TimingDatabase &timingDB, double targetPeriod,
+    const BufferPlacement &priorPlacement, StringRef writeTo)
     : FPL22BuffersBase(solverKind, timeout, funcInfo, timingDB, targetPeriod,
-                       writeTo) {
+                       writeTo), priorPlacement(priorPlacement) {
   if (!unsatisfiable)
     setup();
 }
 
-void OutOfCycleBuffers::setup() {
+void NonCFDFCBuffers::setup() {
   // Signals for which we have variables
   SmallVector<SignalType, 4> signalTypes;
   signalTypes.push_back(SignalType::DATA);
@@ -431,9 +431,8 @@ void OutOfCycleBuffers::setup() {
   const TimingModel *bufModel = nullptr;
 
   BufferingGroup dataValidGroup({SignalType::DATA, SignalType::VALID},
-                                bufModel);
-  BufferingGroup readyGroup({SignalType::READY}, bufModel);
-
+                                nullptr);
+  BufferingGroup readyGroup({SignalType::READY}, nullptr);
   SmallVector<BufferingGroup> bufGroups;
   bufGroups.push_back(dataValidGroup);
   bufGroups.push_back(readyGroup);
@@ -441,71 +440,104 @@ void OutOfCycleBuffers::setup() {
   // Create the expression for the MILP objective
   LinExpr objective;
 
-  // Create a CFDFC union from all CFDFCs in the function so that we can make
-  // very fast queries of the kind: is this channel part of any CFDFC?
-  SmallVector<CFDFC *> allCFDFCs;
-  for (auto [cfdfc, _] : funcInfo.cfdfcs)
-    allCFDFCs.push_back(cfdfc);
-  CFDFCUnion cfUnion(allCFDFCs);
-
-  // Filter out channels part of any CFDFC or adjacent to a memory interface
-  ChannelFilter channelFilter = [&](Value channel) -> bool {
-    if (cfUnion.channels.contains(channel))
-      return false;
-
+  ChannelFilter memFilter = [&](Value channel) -> bool {
     Operation *defOp = channel.getDefiningOp();
     return !isa_and_present<handshake::MemoryOpInterface>(defOp) &&
            !isa<handshake::MemoryOpInterface>(*channel.getUsers().begin());
   };
 
-  // Create variables and  add path and elasticity constraints for all channels
-  // covered by the MILP. These are the channels that are not part of any CFDFC
-  // identified in the Handshake function under consideration
-  for (auto [channel, _] : channelProps) {
-    if (!channelFilter(channel))
-      continue;
+  // Create a CFDFC union from all CFDFCs in the function so that we can make
+  // very fast queries of the kind: is this channel part of any CFDFC?
+  SmallVector<CFDFC *> allCFDFCs;
+  for (auto [cfdfc, _] : funcInfo.cfdfcs)
+    allCFDFCs.push_back(cfdfc);
+  CFDFCUnion allCFDFCsUnion(allCFDFCs);
 
-    // Create channel variables and add custom constraints for the channel
+  // Create variables and add custom and elasticity constraints for every
+  // channel in the function. Unlike `CFDFCUnionBuffers,` there is no 
+  // filtering here.
+  for (auto &[channel, props] : channelProps) {
     addChannelVars(channel, signalTypes);
     addCustomChannelConstraints(channel);
-
-    // Add single-domain path constraints
-    addChannelTimingConstraints(channel, SignalType::DATA, bufModel, {},
-                                readyGroup);
-    addChannelTimingConstraints(channel, SignalType::VALID, bufModel, {},
-                                readyGroup);
-    addChannelTimingConstraints(channel, SignalType::READY, bufModel,
-                                dataValidGroup, {});
-
-    // Add elasticity constraints
     addBufferPresenceConstraints(channel);
     addBufferingGroupConstraints(channel, bufGroups);
 
-    // Add negative terms to MILP objective, penalizing placement of buffers
     ChannelVars &chVars = vars.channelVars[channel];
     CPVar &dataBuf = chVars.signalVars[SignalType::DATA].bufPresent;
     CPVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
+
+    // Read whatever earlier MILPs have decided for this channel.
+    unsigned priorSlots = 0;
+    bool priorForceData = false, priorForceReady = false;
+    if (auto it = priorPlacement.find(channel); it != priorPlacement.end()) {
+      const PlacementResult &prior = it->second;
+      // We do not count numOneSlotR towards the number of buffer slots
+      // because ONE_SLOT_BREAK_R is slow. See FPL22BuffersBase::extractResult.
+      priorSlots = prior.numOneSlotDV + prior.numFifoDV +
+                  prior.numFifoNone + prior.numOneSlotDVR + prior.numShiftRegDV;
+      priorForceData = prior.numOneSlotDV > 0 || prior.numOneSlotDVR > 0 ||
+                       prior.numFifoDV > 0 || prior.numShiftRegDV > 0;
+      priorForceReady = prior.numOneSlotR > 0 || prior.numOneSlotDVR > 0;
+    }
+
+    bool insideCFDFC = allCFDFCsUnion.channels.contains(channel);
+    auto priorBufPresentFor = [&](SignalType sig) -> LinExpr {
+      return LinExpr(
+          (sig == SignalType::READY ? priorForceReady : priorForceData) ? 1.0
+                                                                        : 0.0);
+    };
+    // For a channel inside some CFDFC, the timing constraints use the prior
+    // decision as a constant instead of a live `bufPresent` variable.
+    llvm::function_ref<LinExpr(SignalType)> bufPresentOverride = nullptr;
+    if (insideCFDFC)
+      bufPresentOverride = priorBufPresentFor;
+
+    if (memFilter(channel)) {
+      addChannelTimingConstraints(channel, SignalType::DATA, bufModel, {},
+                                  readyGroup, bufPresentOverride);
+      addChannelTimingConstraints(channel, SignalType::VALID, bufModel, {},
+                                  readyGroup, bufPresentOverride);
+      addChannelTimingConstraints(channel, SignalType::READY, bufModel,
+                                  dataValidGroup, {}, bufPresentOverride);
+    }
+
+    // Never let the total number of slots go below what an earlier MILP has
+    // already decided.
+    if (priorSlots > 0)
+      model->addConstr(chVars.bufNumSlots >= priorSlots, "prior_minSlots");
+
+    if (insideCFDFC) {
+      // Fix the decision for channels inside CFDFCs.
+      model->addConstr(dataBuf == (priorForceData ? 1.0 : 0.0),
+                       "prior_pinData");
+      model->addConstr(readyBuf == (priorForceReady ? 1.0 : 0.0),
+                       "prior_pinReady");
+    } else {
+      // Set lowerbounds for channels outside CFDFCs.
+      if (priorForceData)
+        model->addConstr(dataBuf >= 1.0, "prior_forceData");
+      if (priorForceReady)
+        model->addConstr(readyBuf >= 1.0, "prior_forceReady");
+    }
+
     objective -= dataBuf;
     objective -= readyBuf;
     objective -= 0.1 * chVars.bufNumSlots;
   }
 
-  // Add single-domain and mixed-domain path constraints as well as elasticity
-  // constraints over all units that are not part of any CFDFC
+  // Unit path constraints (single-domain and mixed-domain) over all three
+  // signal domains.
   for (Operation &unit : funcInfo.funcOp.getOps()) {
-    if (cfUnion.units.contains(&unit))
-      continue;
-
     if (isa<handshake::SpeculatorOp, handshake::SpecSaveCommitOp>(&unit)) {
       addSpecUnitConstraints(
           &unit, {SignalType::DATA, SignalType::VALID, SignalType::READY},
-          channelFilter);
+          memFilter);
       continue;
     }
-    addUnitTimingConstraints(&unit, SignalType::DATA, channelFilter);
-    addUnitTimingConstraints(&unit, SignalType::VALID, channelFilter);
-    addUnitTimingConstraints(&unit, SignalType::READY, channelFilter);
-    addUnitMixedPathConstraints(&unit, channelFilter);
+    addUnitTimingConstraints(&unit, SignalType::DATA, memFilter);
+    addUnitTimingConstraints(&unit, SignalType::VALID, memFilter);
+    addUnitTimingConstraints(&unit, SignalType::READY, memFilter);
+    addUnitMixedPathConstraints(&unit, memFilter);
   }
 
   // Set MILP objective and mark it ready to be optimized

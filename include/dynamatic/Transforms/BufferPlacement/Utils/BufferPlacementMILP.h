@@ -35,6 +35,7 @@
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include <functional>
@@ -257,7 +258,8 @@ protected:
   void addChannelTimingConstraints(Value channel, SignalType signalType,
                                    const TimingModel *bufModel,
                                    ArrayRef<BufferingGroup> before = {},
-                                   ArrayRef<BufferingGroup> after = {});
+                                   ArrayRef<BufferingGroup> after = {},
+          llvm::function_ref<LinExpr(SignalType)> bufPresentOverride = nullptr);
 
   /// Adds path constraints for a specific signal type between the unit's input
   /// and output ports. If the internal path for the signal is combinational, a
