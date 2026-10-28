@@ -204,7 +204,18 @@ def HandshakeMaterialize : Pass<"handshake-materialize", "mlir::ModuleOp"> {
     LSQ never happen on the same cycle.   
   }];
   let options = [Option<"replicateConstants", "replicate-constant", "bool", "false",
-            "If true, replicate all the source->constant per each use.">];
+            "If true, replicate all the source->constant per each use.">,
+        Option<"instantiateBuffers", "instantiate-buffers", "bool", "false",
+            "If true, buffers related to the structure of the circuit "
+            "(LSQ group-allocation, Speculator volatility, and buffers "
+            "needed for LSQ's lazy forks (if lazyForks is true, the last "
+            "type is delegated to dependency rank constraints)) are actually "
+            "instantiated just like any other component in the circuit. "
+            "Otherwise, constraints are set and the instantiation is done "
+            "after buffer-placement MILP decisions.">,
+        Option<"lazyForks", "lazy-forks", "bool", "false",
+            "If true, all forks are converted to lazy and eager forks are "
+            "no longer allowed.">];
   let dependentDialects = ["dynamatic::handshake::HandshakeDialect"];
 }
 

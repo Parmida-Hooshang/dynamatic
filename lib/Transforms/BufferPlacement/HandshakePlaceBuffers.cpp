@@ -407,8 +407,8 @@ static bool isBackedgeSourceLike(Operation *op) {
     if (isa<handshake::BranchOp, handshake::ConditionalBranchOp,
             handshake::CmpIOp, handshake::CmpFOp>(op))
       return true;
-    if (isa<handshake::ForkOp, handshake::ExtUIOp, handshake::ExtSIOp,
-            handshake::TruncIOp>(op))
+    if (isa<handshake::ForkOp, handshake::LazyForkOp, handshake::ExtUIOp, 
+            handshake::ExtSIOp, handshake::TruncIOp>(op))
       op = op->getOperand(0).getDefiningOp();
     else
       return false;

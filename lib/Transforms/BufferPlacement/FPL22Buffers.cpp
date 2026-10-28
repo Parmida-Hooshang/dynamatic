@@ -277,6 +277,20 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
           }
         }
       })
+      .Case<handshake::LazyForkOp>([&](handshake::LazyForkOp lazyForkOp) {
+        // A lazy fork only raises an output's valid once every other
+        // output's ready is high, so there is a path between the ready
+        // pin of every output and the valid pin of every other output
+        for (OpResult outValid : lazyForkOp->getResults()) {
+          for (OpResult outReady : lazyForkOp->getResults()) {
+            if (outValid == outReady)
+              continue;
+            // 0.0 should be replaced with the correct value
+            constraints.emplace_back(Pin(outReady, SignalType::READY),
+                                     Pin(outValid, SignalType::VALID), 0.0);
+          }
+        }
+      })
       .Case<handshake::LoadOp, handshake::StoreOp, handshake::AddIOp,
             handshake::AddFOp, handshake::SubIOp, handshake::SubFOp,
             handshake::AndIOp, handshake::OrIOp, handshake::XOrIOp,

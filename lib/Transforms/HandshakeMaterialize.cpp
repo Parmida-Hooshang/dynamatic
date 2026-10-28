@@ -13,9 +13,11 @@
 
 #include "dynamatic/Transforms/HandshakeMaterialize.h"
 #include "dynamatic/Dialect/Handshake/HandshakeCanonicalize.h"
+#include "dynamatic/Dialect/Handshake/HandshakeInterfaces.h"
 #include "dynamatic/Dialect/Handshake/HandshakeOps.h"
 #include "dynamatic/Dialect/Handshake/MemoryInterfaces.h"
 #include "dynamatic/Support/CFG.h"
+#include "dynamatic/Transforms/BufferPlacement/Utils/BufferingSupport.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -32,6 +34,13 @@ namespace dynamatic {
 #include "dynamatic/Transforms/Passes.h.inc"
 } // namespace dynamatic
 // [END Boilerplate code for the MLIR pass]
+
+/// End of warning message when a fork output that needs its data/valid path
+/// cut already carries a conflicting constraint (only used in
+/// non-instantiating mode, see `insertLSQGroupAllocationBuffers`).
+static const llvm::StringLiteral
+    ERR_CONFLICT("but previous channel constraints prevent buffering. "
+                 "Resulting circuit may deadlock.");
 
 /// Determines whether the value should be concerned by materialization rules;
 /// only SSA values with dataflow semantics must have a single use.
@@ -121,13 +130,33 @@ static void materializeValue(Value val, OpBuilder &builder) {
     replaceFirstUse(user, val, forkRes);
 }
 
+/// Converts all eager forks to lazy forks (used for --lazy-forks).
+static void promoteAllForksToLazy(handshake::FuncOp funcOp) {
+  OpBuilder builder(funcOp->getContext());
+  for (handshake::ForkOp forkOp :
+       llvm::make_early_inc_range(funcOp.getOps<handshake::ForkOp>())) {
+    builder.setInsertionPoint(forkOp);
+    auto lazyForkOp = builder.create<handshake::LazyForkOp>(
+        forkOp->getLoc(), forkOp.getOperand(), forkOp->getNumResults());
+    inheritBB(forkOp, lazyForkOp);
+    forkOp->replaceAllUsesWith(lazyForkOp->getResults());
+    forkOp->erase();
+  }
+}
+
 /// Promotes some eager forks to lazy forks to ensure that different group
 /// allocations to the same LSQ do not arrive to the LSQ on the same cycle. This
-/// assumes that the IR is materialized.
-static void promoteEagerToLazyForks(handshake::FuncOp funcOp) {
+/// assumes that the IR is materialized. If `lazyForks` is true, calls
+/// `promoteAllForksToLazy` and converts all eager forks to lazy forks.
+static void promoteEagerToLazyForks(handshake::FuncOp funcOp, bool lazyForks) {
+  if (lazyForks) {
+    promoteAllForksToLazy(funcOp);
+    return;
+  }
+
   // Associate all eager forks feeding group allocation signals to any LSQ to
   // the set of their results that must become lazy
-  DenseMap<handshake::ForkOp, SetVector<Value>> lazyChannels;
+  llvm::DenseMap<handshake::ForkOp, llvm::SetVector<Value>> lazyChannels;
   for (auto lsqOp : funcOp.getOps<handshake::LSQOp>()) {
     LSQPorts lsqPorts = lsqOp.getPorts();
     ValueRange lsqInputs = lsqOp.getOperands();
@@ -223,6 +252,201 @@ static void promoteEagerToLazyForks(handshake::FuncOp funcOp) {
     forkOp->erase();
   }
 }
+
+static void makeUnbufferizable(Value val) {
+  assert(!val.use_empty() &&
+         "Cannot treat a value without a use as a channel!");
+
+  buffer::Channel channel(val, true);
+  channel.props->maxOpaque = 0;
+  channel.props->maxTrans = 0;
+}
+
+/// Marks memory reference function arguments and memory interface ports as
+/// unbufferizable.
+static void setMemoryUnbufferizableProperties(handshake::FuncOp funcOp) {
+  // See docs/Specs/Buffering.md
+  // Memrefs are not real edges in the graph and are therefore unbufferizable
+  for (BlockArgument arg : funcOp.getArguments())
+    makeUnbufferizable(arg);
+
+  // Ports of memory interfaces are unbufferizable
+  for (auto memOp : funcOp.getOps<handshake::MemoryOpInterface>()) {
+    FuncMemoryPorts ports = getMemoryPorts(memOp);
+    for (size_t i = 0, e = ports.getNumGroups(); i < e; ++i) {
+      for (Value inputVal : ports.getGroupInputs(i))
+        makeUnbufferizable(inputVal);
+      for (Value outputVal : ports.getGroupResults(i))
+        makeUnbufferizable(outputVal);
+    }
+    for (Value inputVal : ports.getInterfacesInputs())
+      makeUnbufferizable(inputVal);
+    for (Value outputVal : ports.getInterfacesResults())
+      makeUnbufferizable(outputVal);
+  }
+}
+
+/// Ensures the speculator's volatile channels (dataOut, issueCtrl, and
+/// trigger) get at least one transparent buffer slot.
+static void insertSpeculatorVolatilityBuffers(handshake::FuncOp funcOp,
+                                              bool instantiate) {
+  OpBuilder builder(funcOp.getContext());
+
+  // Handles `val`, either by setting a constraint on it, or by inserting a
+  // buffer between it and its consumer. Works regardless of whether `val` 
+  // is conceptually an input or an output of the operation of interest.
+  auto handleValue = [&](Value val) {
+    if (!instantiate) {
+      buffer::Channel channel(val, true);
+      channel.props->minTrans = std::max(channel.props->minTrans, 1U);
+      return;
+    }
+
+    // This pass can run twice on the same function (once before speculation, 
+    // once more right after --handshake-speculation), so skip if there is a
+    // buffer on either side of this value.
+    if (isa_and_present<handshake::BufferOp>(val.getDefiningOp()) ||
+        isa<handshake::BufferOp>(*val.getUsers().begin()))
+      return;
+
+    Operation *consumer = *val.getUsers().begin();
+    builder.setInsertionPoint(consumer);
+    auto bufOp = builder.create<handshake::BufferOp>(
+        val.getLoc(), val, /*numSlots=*/1, handshake::BufferType::ONE_SLOT_BREAK_R);
+    inheritBB(consumer, bufOp);
+    consumer->replaceUsesOfWith(val, bufOp->getResult(0));
+  };
+
+  for (handshake::SpeculatorOp specOp :
+       funcOp.getOps<handshake::SpeculatorOp>()) {
+    handleValue(specOp.getDataOut());
+    handleValue(specOp.getIssueCtrl());
+    handleValue(specOp.getTrigger());
+  }
+}
+
+/// Ensures every input channel of Store/Load operations that connect to an
+/// LSQ has at least one slot.
+static void insertLoadStoreBuffers(handshake::FuncOp funcOp, bool instantiate) {
+  OpBuilder builder(funcOp.getContext());
+
+  auto handleOperand = [&](Operation *memPortOp, unsigned oprdIdx) {
+    Value operand = memPortOp->getOperand(oprdIdx);
+    Operation *defOp = operand.getDefiningOp();
+    if (!defOp)
+      return;
+
+    if (!instantiate) {
+      buffer::Channel channel(operand, true);
+      channel.props->minSlots = std::max(channel.props->minSlots, 1U);
+      return;
+    }
+
+    // This pass can run twice on the same function (once before speculation, 
+    // once more right after --handshake-speculation), so skip if operands 
+    // are already fed by a buffer.
+    if (isa<handshake::BufferOp>(defOp))
+      return;
+
+    builder.setInsertionPoint(memPortOp);
+    auto bufOp = builder.create<handshake::BufferOp>(
+        operand.getLoc(), operand, /*numSlots=*/1,
+        handshake::BufferType::ONE_SLOT_BREAK_R);
+    inheritBB(memPortOp, bufOp);
+    memPortOp->setOperand(oprdIdx, bufOp->getResult(0));
+  };
+
+  for (handshake::StoreOp storeOp : funcOp.getOps<handshake::StoreOp>()) {
+    if (!isa_and_present<handshake::LSQOp>(
+            findMemInterface(storeOp.getAddressResult())))
+      continue;
+    for (unsigned i = 0, e = storeOp->getNumOperands(); i < e; ++i)
+      handleOperand(storeOp, i);
+  }
+
+  for (handshake::LoadOp loadOp : funcOp.getOps<handshake::LoadOp>()) {
+    if (!isa_and_present<handshake::LSQOp>(
+            findMemInterface(loadOp.getAddressResult())))
+      continue;
+    for (unsigned i = 0, e = loadOp->getNumOperands(); i < e; ++i) {
+      Operation *defOp = loadOp->getOperand(i).getDefiningOp();
+      if (defOp &&
+          isa<handshake::MemoryOpInterface, handshake::ConstantOp>(defOp))
+        continue;
+      handleOperand(loadOp, i);
+    }
+  }
+}
+
+/// Sets buffering constraints related to the LSQ's control path. Output
+/// channels of group-allocation-signal-defining (lazy-)forks to the LSQ must be
+/// buffered in a particular way:
+/// - direct outputs between the fork and LSQs must remain unbuffered
+/// - outputs going to next group allocations to the same LSQ must have their
+/// data/valid paths cut
+/// - all other outputs must have their ready path cut
+static void insertLSQGroupAllocationBuffers(handshake::FuncOp funcOp,
+                                            OpBuilder &builder,
+                                            bool instantiate) {
+  for (handshake::LSQOp lsqOp : funcOp.getOps<handshake::LSQOp>()) {
+    LSQPorts ports = lsqOp.getPorts();
+    ValueRange lsqInputs = lsqOp.getOperands();
+
+    for (LSQGroup &group : ports.getGroups()) {
+      // Control signal must come from a fork for this to apply
+      Value ctrlVal = lsqInputs[group->ctrlPort->getCtrlInputIndex()];
+      Operation *ctrlDefOp = ctrlVal.getDefiningOp();
+      if (!mlir::isa_and_present<handshake::ForkOp, handshake::LazyForkOp>(
+              ctrlDefOp))
+        continue;
+
+      // Fork output channels triggering group allocations to the same LSQ
+      // need their data/valid paths cut
+      SmallVector<Value> ctrlPaths = lsqOp.getControlPaths(ctrlDefOp);
+      llvm::SmallSetVector<Value, 4> ctrlPathSet(ctrlPaths.begin(),
+                                                 ctrlPaths.end());
+      for (OpResult forkRes : ctrlDefOp->getResults()) {
+        if (!ctrlPathSet.contains(forkRes))
+          continue;
+
+        // Channels connecting directly to LSQs should be left alone (group
+        // allocation signals have already been rendered unbufferizable)
+        Operation *consumer = *forkRes.getUsers().begin();
+        if (isa<handshake::LSQOp>(consumer))
+          continue;
+
+        if (!instantiate) {
+          buffer::Channel channel(forkRes, true);
+          if (channel.props->maxOpaque.value_or(1) > 0) {
+            channel.props->minOpaque = std::max(channel.props->minOpaque, 1U);
+          } else {
+            OpOperand &oprd = channel.getOperand();
+            ctrlDefOp->emitWarning()
+                << "Fork result " << forkRes.getResultNumber() << " ("
+                << getUniqueName(oprd)
+                << ") is on path to other LSQ group allocation and should "
+                   "have its data/valid paths cut, "
+                << ERR_CONFLICT;
+          }
+          continue;
+        }
+
+        // This pass can run twice on the same function. Skip if already
+        // buffered.
+        if (isa<handshake::BufferOp>(consumer))
+          continue;
+
+        builder.setInsertionPoint(consumer);
+        auto bufOp = builder.create<handshake::BufferOp>(
+            forkRes.getLoc(), forkRes, /*numSlots=*/1,
+            handshake::BufferType::ONE_SLOT_BREAK_DV);
+        inheritBB(consumer, bufOp);
+        consumer->replaceUsesOfWith(forkRes, bufOp->getResult(0));
+      }
+    }
+  }
+}
+
 namespace {
 
 /// Removes outputs of forks that do not have real uses. This can result in the
@@ -458,7 +682,18 @@ struct HandshakeMaterializePass
 
     // Finally, promote forks to lazy wherever necessary
     for (handshake::FuncOp funcOp : modOp.getOps<handshake::FuncOp>())
-      promoteEagerToLazyForks(funcOp);
+      promoteEagerToLazyForks(funcOp, this->lazyForks);
+
+    // The IR is now fully materialized. Only now can we safely attach buffering
+    // constraints that are anchored to a specific channel: memory-interface
+    // ports (and memrefs) remain unbufferizable, and the speculator's
+    // volatile channels get a transparent buffer slot.
+    for (handshake::FuncOp funcOp : modOp.getOps<handshake::FuncOp>()) {
+      setMemoryUnbufferizableProperties(funcOp);
+      insertSpeculatorVolatilityBuffers(funcOp, this->instantiateBuffers);
+      insertLoadStoreBuffers(funcOp, this->instantiateBuffers);
+      insertLSQGroupAllocationBuffers(funcOp, builder, this->instantiateBuffers);
+    }
 
     assert(succeeded(verifyIRMaterialized(modOp)) && "IR is not materialized");
 

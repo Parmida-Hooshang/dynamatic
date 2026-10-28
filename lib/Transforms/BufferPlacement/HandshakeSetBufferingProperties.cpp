@@ -43,73 +43,10 @@ static const llvm::StringLiteral
     ERR_CONFLICT("but previous channel constraints prevent buffering. "
                  "Resulting circuit may deadlock.");
 
-/// Makes the channel unbufferizable.
-static void makeUnbufferizable(Value val) {
-  assert(!val.use_empty() &&
-         "Cannot treat a value without a use as a channel!");
-
-  Channel channel(val, true);
-  channel.props->maxOpaque = 0;
-  channel.props->maxTrans = 0;
-}
-
-// The speculator requires specific buffers
-// for correctness
-static LogicalResult
-setSpeculatorBufferingProperties(handshake::FuncOp funcOp) {
-  auto specOps = funcOp.getOps<handshake::SpeculatorOp>();
-  auto specCount = std::distance(specOps.begin(), specOps.end());
-  if (specCount > 1) {
-    funcOp.emitError() << "Expected at most one SpeculatorOp";
-    return failure();
-  }
-  // no spec op = successful buffer placement
-  if (specCount == 0)
-    return success();
-
-  auto specOp = *specOps.begin();
-
-  // dataOut is volatile
-  // (value can change without being accepted,
-  // from a predicted value
-  // to re-sending an mis-predicted value)
-  // and so is not safe to connect to an eager fork.
-  // We place a buffer here for safety
-  Value dataOut = specOp.getDataOut();
-  Channel dataChannel(dataOut, true);
-  dataChannel.props->minTrans = std::max(dataChannel.props->minTrans, 1U);
-
-  // issueCtrl is volatile
-  // (value can change without being accepted,
-  // from spec to resend)
-  // and so if not safe to connect to an eager fork
-  // We place a buffer here for safety.
-  Value issueCtrl = specOp.getIssueCtrl();
-  Channel issueChannel(issueCtrl, true);
-  issueChannel.props->minTrans = std::max(issueChannel.props->minTrans, 1U);
-
-  // historyCtrl is on a path from a lazy fork
-  // to a join
-  // and so needs a buffer to prevent deadlock
-  Value historyCtrl = specOp.getHistoryCtrl();
-  Channel resolveChannel(historyCtrl, true);
-  resolveChannel.props->minTrans = std::max(resolveChannel.props->minTrans, 1U);
-
-  Value trigger = specOp.getTrigger();
-  Channel triggerChannel(trigger, true);
-  triggerChannel.props->minTrans = std::max(triggerChannel.props->minTrans, 1U);
-
-  return success();
-}
-
-/// Sets buffering constraints related to the LSQ's control path. Output
-/// channels of group-allocation-signal-defining (lazy-)forks to the LSQ must be
-/// buffered in a particular way:
-/// - direct outputs between the fork and LSQs must remain unbuffered
-/// - outputs going to next group allocations to the same LSQ must have their
-/// data/valid paths cut
-/// - all other outputs must have their ready path cut
-static void setLSQControlConstraints(handshake::LSQOp lsqOp) {
+/// Sets the ready-path-cut constraint on LSQ group-allocation control forks'
+/// output channels that do not lead to another group allocation of the same
+/// LSQ (not needed if --lazy-forks is used).
+static void setLSQReadyPathConstraints(handshake::LSQOp lsqOp) {
   LSQPorts ports = lsqOp.getPorts();
   ValueRange lsqInputs = lsqOp.getOperands();
 
@@ -121,50 +58,58 @@ static void setLSQControlConstraints(handshake::LSQOp lsqOp) {
             ctrlDefOp))
       continue;
 
-    // Force placement of an opaque buffer slot on other fork output channels
-    // triggering group allocations to the same LSQ. Other output channels not
-    // part of the control paths to the LSQ get a transparent buffer slot
+    // Fork output channels not on a control path to a group allocation of
+    // this LSQ get a transparent buffer slot constraint
     SmallVector<Value> ctrlPaths = lsqOp.getControlPaths(ctrlDefOp);
     llvm::SmallSetVector<Value, 4> ctrlPathSet(ctrlPaths.begin(),
                                                ctrlPaths.end());
     for (OpResult forkRes : ctrlDefOp->getResults()) {
+      if (ctrlPathSet.contains(forkRes))
+        continue;
+
       // Channels connecting directly to LSQs should be left alone (group
-      // allocation signals have already been rendered unbufferizable before,
-      // i.e., in setFPGA20Properties)
+      // allocation signals have already been marked unbufferizable in 
+      // handshake materialization).
       if (isa<handshake::LSQOp>(*forkRes.getUsers().begin()))
         continue;
 
-      if (ctrlPathSet.contains(forkRes)) {
-        // Path goes to other group allocation to the same LSQ
-        Channel channel(forkRes, true);
-        if (channel.props->maxOpaque.value_or(1) > 0) {
-          channel.props->minOpaque = std::max(channel.props->minOpaque, 1U);
-        } else {
-          OpOperand &oprd = channel.getOperand();
-          ctrlDefOp->emitWarning()
-              << "Fork result " << forkRes.getResultNumber() << " ("
-              << getUniqueName(oprd)
-              << ") is on path to other LSQ group allocation and should "
-                 "have its data/valid paths cut, "
-              << ERR_CONFLICT;
-        }
+      Channel channel(forkRes, true);
+      if (channel.props->maxTrans.value_or(1) > 0) {
+        channel.props->minTrans = std::max(channel.props->minTrans, 1U);
       } else {
-        // Path does not go to the same LSQ
-        Channel channel(forkRes, true);
-        if (channel.props->maxTrans.value_or(1) > 0) {
-          channel.props->minTrans = std::max(channel.props->minTrans, 1U);
-        } else {
-          OpOperand &oprd = channel.getOperand();
-          ctrlDefOp->emitWarning()
-              << "Fork result " << forkRes.getResultNumber() << " ("
-              << getUniqueName(oprd)
-              << ") is *not* on path to other LSQ group allocation and "
-                 "should have its ready path cut, "
-              << ERR_CONFLICT;
-        }
+        OpOperand &oprd = channel.getOperand();
+        ctrlDefOp->emitWarning()
+            << "Fork result " << forkRes.getResultNumber() << " ("
+            << getUniqueName(oprd)
+            << ") is *not* on path to other LSQ group allocation and "
+                "should have its ready path cut, "
+            << ERR_CONFLICT;
       }
     }
   }
+}
+
+// The speculator requires specific buffers for correctness.
+static LogicalResult setSpeculatorBufferingProperties(handshake::FuncOp funcOp) {
+  auto specOps = funcOp.getOps<handshake::SpeculatorOp>();
+  auto specCount = std::distance(specOps.begin(), specOps.end());
+  if (specCount > 1) {
+    funcOp.emitError() << "Expected at most one SpeculatorOp";
+    return failure();
+  }
+  
+  if (specCount == 0)
+    return success();
+
+  auto specOp = *specOps.begin();
+
+  // historyCtrl is on a path from a lazy fork to a join and so needs 
+  // a buffer to prevent deadlock (if --lazy-forks is not used).
+  Value historyCtrl = specOp.getHistoryCtrl();
+  Channel resolveChannel(historyCtrl, true);
+  resolveChannel.props->minTrans = std::max(resolveChannel.props->minTrans, 1U);
+
+  return success();
 }
 
 static LogicalResult setFPGA20Properties(handshake::FuncOp funcOp) {
@@ -195,66 +140,9 @@ static LogicalResult setFPGA20Properties(handshake::FuncOp funcOp) {
   }
 
   // See docs/Specs/Buffering.md
-  // To mitigate the latency asymmetry between LSQ group allocation
-  // and the Store/Load operations, we set a minimum number of buffer
-  // slots at Store/Load's input.
-  // This is a temporary workaround and a better solution is needed.
-  for (handshake::StoreOp storeOp : funcOp.getOps<handshake::StoreOp>()) {
-    auto memOp = findMemInterface(storeOp.getAddressResult());
-    if (!mlir::isa_and_present<handshake::LSQOp>(memOp))
-      continue;
-
-    for (Value operand : storeOp->getOperands()) {
-      Channel channel(operand, true);
-      Operation *defOp = operand.getDefiningOp();
-
-      if (defOp) {
-        channel.props->minSlots = std::max(channel.props->minSlots, 1U);
-      }
-    }
-  }
-
-  for (handshake::LoadOp loadOp : funcOp.getOps<handshake::LoadOp>()) {
-    auto memOp = findMemInterface(loadOp.getAddressResult());
-    if (!mlir::isa_and_present<handshake::LSQOp>(memOp))
-      continue;
-
-    for (Value operand : loadOp->getOperands()) {
-      Channel channel(operand, true);
-      Operation *defOp = operand.getDefiningOp();
-
-      if (defOp &&
-          !isa<handshake::MemoryOpInterface, handshake::ConstantOp>(defOp)) {
-        channel.props->minSlots = std::max(channel.props->minSlots, 1U);
-      }
-    }
-  }
-
-  // See docs/Specs/Buffering.md
-  // Memrefs are not real edges in the graph and are therefore unbufferizable
-  for (BlockArgument arg : funcOp.getArguments()) {
-    makeUnbufferizable(arg);
-  }
-
-  // Ports of memory interfaces are unbufferizable
-  for (auto memOp : funcOp.getOps<handshake::MemoryOpInterface>()) {
-    FuncMemoryPorts ports = getMemoryPorts(memOp);
-    for (size_t i = 0, e = ports.getNumGroups(); i < e; ++i) {
-      for (Value inputVal : ports.getGroupInputs(i))
-        makeUnbufferizable(inputVal);
-      for (Value outputVal : ports.getGroupResults(i))
-        makeUnbufferizable(outputVal);
-    }
-    for (Value inputVal : ports.getInterfacesInputs())
-      makeUnbufferizable(inputVal);
-    for (Value outputVal : ports.getInterfacesResults())
-      makeUnbufferizable(outputVal);
-  }
-
-  // See docs/Specs/Buffering.md
   // Control paths to LSQs have specific properties
   for (handshake::LSQOp lsqOp : funcOp.getOps<handshake::LSQOp>())
-    setLSQControlConstraints(lsqOp);
+    setLSQReadyPathConstraints(lsqOp);
 
   if (failed(setSpeculatorBufferingProperties(funcOp)))
     return failure();
