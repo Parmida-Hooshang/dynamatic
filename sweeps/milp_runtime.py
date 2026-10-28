@@ -40,7 +40,7 @@ CSV_FIELDS = ["test", "run", "clock_period_ns", "status", "num_milps",
 def parse_solve_times(log: str):
     """Returns [(model name, seconds)] for every MILP solved, in order."""
     return [(Path(name).name or "unnamed", float(t)) for name, t in re.findall(
-        r"TEMP DEBUG: MILP \((.*?)\) solve time=([\d.eE+-]+) s", log)]
+        r"MILP \((.*?)\) solve time=([\d.eE+-]+) s", log)]
 
 
 def run_compile(src: Path, period: float, run: int, args) -> dict:

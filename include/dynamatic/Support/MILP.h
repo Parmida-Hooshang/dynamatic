@@ -19,6 +19,7 @@
 #include "dynamatic/Support/LLVM.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
+#include <chrono>
 
 namespace dynamatic {
 
@@ -89,7 +90,13 @@ public:
       // Logging the MILP model
       model->write(writeTo + "_model.lp");
     }
+    auto solveStart = std::chrono::steady_clock::now();
     model->optimize();
+    std::chrono::duration<double> solveTime =
+        std::chrono::steady_clock::now() - solveStart;
+    llvm::errs() << "MILP (" << writeTo
+                 << ") solve time=" << solveTime.count() << " s\n";
+
 
     switch (model->status) {
     case CPSolver::INFEASIBLE:

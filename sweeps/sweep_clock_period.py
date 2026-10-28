@@ -46,7 +46,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-DYNAMATIC_DIR = Path(__file__).resolve().parent
+DYNAMATIC_DIR = Path(__file__).resolve().parent.parent
 DYNAMATIC_BIN = DYNAMATIC_DIR / "bin" / "dynamatic"
 INTEGRATION_DIR = DYNAMATIC_DIR / "integration-test"
 
