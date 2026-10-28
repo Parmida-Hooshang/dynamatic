@@ -1,3 +1,5 @@
+// obf - fast opaque - break valid and data
+
 `timescale 1ns/1ps
 module oehb #(
   parameter DATA_TYPE = 32
@@ -13,29 +15,27 @@ module oehb #(
   output outs_valid,
   input  outs_ready
 );
-  wire regEn, inputReady;
-  reg [DATA_TYPE - 1 : 0] dataReg = 0;
-  
-  // Instance of oehb_dataless to manage handshaking
-  oehb_dataless control (
-    .clk        (clk       ),
-    .rst        (rst       ),
-    .ins_valid  (ins_valid ),
-    .ins_ready  (inputReady),
-    .outs_valid (outs_valid),
-    .outs_ready (outs_ready)
-  );
+  wire en;
+  reg full = 1'b0;
+  reg [DATA_TYPE - 1 : 0] reg_outs = {DATA_TYPE{1'b0}};
 
   always @(posedge clk) begin
     if (rst) begin
-      dataReg <= {DATA_TYPE{1'b0}};
-    end else if (regEn) begin
-      dataReg <= ins;
+      full <= 1'b0;
+      reg_outs <= {DATA_TYPE{1'b0}};
+    end
+    else begin
+      if (en) begin
+        reg_outs <= ins;
+      end
+
+      full <= ins_valid | (full & ~outs_ready);
     end
   end
 
-  assign ins_ready = inputReady;
-  assign regEn = inputReady & ins_valid;
-  assign outs = dataReg;
+  assign outs_valid = full;
+  assign ins_ready = ~full | outs_ready;
+  assign en = (~full | outs_ready) & ins_valid;
+  assign outs = reg_outs;
 
 endmodule

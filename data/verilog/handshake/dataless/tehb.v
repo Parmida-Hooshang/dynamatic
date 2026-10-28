@@ -1,3 +1,5 @@
+// tbs - slow transparent - break ready
+
 `timescale 1ns/1ps
 module tehb_dataless (
 	input  clk,
@@ -9,17 +11,18 @@ module tehb_dataless (
   output outs_valid,	
 	input  outs_ready
 );
-	reg fullReg = 0;
-	
-	always @(posedge clk) begin
-		if (rst) begin
-			fullReg <= 0;
-		end else begin
-			fullReg <= (ins_valid | fullReg) & ~outs_ready;
-		end
-	end
+	reg full = 1'b0;
 
-	assign ins_ready = ~fullReg;
-	assign outs_valid = ins_valid | fullReg;
+  always @(posedge clk) begin
+    if (rst) begin
+      full <= 1'b0;
+    end
+    else begin
+      full <= ~outs_ready & (full | ins_valid);
+    end
+  end
+
+  assign outs_valid = full | ins_valid;
+  assign ins_ready = ~full;
 
 endmodule

@@ -1,3 +1,5 @@
+// tbs - slow transparent - break ready
+
 `timescale 1ns/1ps
 module tehb #(
 	parameter DATA_TYPE = 32 // Default set to 32 bits
@@ -13,33 +15,27 @@ module tehb #(
   output outs_valid,
 	input  outs_ready
 );
-	// Signal Definition
-	wire regEnable, regNotFull;
-	reg [DATA_TYPE - 1 : 0] dataReg = 0;
+	wire en;
+  reg full = 1'b0;
+  reg [DATA_TYPE - 1 : 0] reg_outs = {DATA_TYPE{1'b0}};
 
-	// Instantiate control logic part
-	tehb_dataless control (
-		.clk		    (clk	     ),
-		.rst		    (rst	     ),
-		.ins_valid	(ins_valid ),
-    .ins_ready	(regNotFull),
-		.outs_valid	(outs_valid),
-		.outs_ready	(outs_ready)
-	);
+  always @(posedge clk) begin
+    if (rst) begin
+      full <= 1'b0;
+      reg_outs <= {DATA_TYPE{1'b0}};
+    end
+    else begin
+      if (en) begin
+        reg_outs <= ins;
+      end
 
-	assign regEnable = regNotFull & ins_valid & ~outs_ready;
+      full <= ~outs_ready & (full | ins_valid);
+    end
+  end
 
-	always @(posedge clk) begin
-		if (rst) begin
-			dataReg <= 0;
-		end else if (regEnable) begin
-			dataReg <= ins;
-		end
-	end
-
-	// Output Assignment
-	assign outs = regNotFull ? ins : dataReg;
-
-	assign ins_ready = regNotFull;
+  assign outs_valid = full | ins_valid;
+  assign ins_ready = ~full;
+  assign en = ~outs_ready & ins_valid & ~full;
+  assign outs = (~full ? ins : reg_outs);
 
 endmodule

@@ -1,3 +1,5 @@
+// obf - fast opaque - break valid
+
 `timescale 1ns/1ps
 module oehb_dataless (
   input  clk,
@@ -9,18 +11,20 @@ module oehb_dataless (
   output outs_valid,
   input  outs_ready
 );
-  // Define internal signals
-  reg outputValid = 0;
-
+  wire en;
+  reg full = 1'b0;
+  
   always @(posedge clk) begin
     if (rst) begin
-      outputValid <= 0;
-    end else begin
-      outputValid <= ins_valid | (~outs_ready & outputValid);
+      full <= 1'b0;
+    end
+    else begin
+      full <= ins_valid | (full & ~outs_ready);
     end
   end
 
-  assign ins_ready = ~outputValid | outs_ready;
-  assign outs_valid = outputValid;
+  assign outs_valid = full;
+  assign ins_ready = ~full | outs_ready;
+  assign en = (~full | outs_ready) & ins_valid;
   
 endmodule
