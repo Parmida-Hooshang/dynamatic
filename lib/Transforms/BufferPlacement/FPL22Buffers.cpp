@@ -242,12 +242,41 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
             addJoinedOprdConstraints();
           })
       .Case<handshake::ControlMergeOp>([&](handshake::ControlMergeOp cmergeOp) {
-        // There is a path between the valid pin of the first operand and the
-        // data pin of the index result
-        Pin input(cmergeOp.getOperand(0), SignalType::VALID);
-        Pin output(cmergeOp.getIndex(), SignalType::DATA);
         double vc = unitModel ? unitModel->validToCond : 0.0;
-        constraints.emplace_back(input, output, vc);
+        double vr = unitModel ? unitModel->validToReady : 0.0;
+
+        if (cmergeOp->hasAttr("handshake.lazy_forks")) {
+          for (auto [i, oprd] : llvm::enumerate(cmergeOp->getOperands()))
+            for (auto [k, readyOprd] : llvm::enumerate(cmergeOp->getOperands()))
+              if (i <= k)
+                constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                         Pin(readyOprd, SignalType::READY), vr);
+
+          for (Value oprd : cmergeOp->getOperands())
+            constraints.emplace_back(
+                Pin(oprd, SignalType::VALID),
+                Pin(cmergeOp.getIndex(), SignalType::DATA), vc);
+
+          // Internal lazy fork.
+          constraints.emplace_back(
+              Pin(cmergeOp.getIndex(), SignalType::READY),
+              Pin(cmergeOp.getResult(), SignalType::VALID), 0.0);
+          constraints.emplace_back(
+              Pin(cmergeOp.getResult(), SignalType::READY),
+              Pin(cmergeOp.getIndex(), SignalType::VALID), 0.0);
+          return;
+        }
+
+        for (Value oprd : cmergeOp->getOperands())
+            constraints.emplace_back(
+                Pin(oprd, SignalType::VALID),
+                Pin(cmergeOp.getIndex(), SignalType::DATA), vc);
+
+        for (auto [i, oprd] : llvm::enumerate(cmergeOp->getOperands()))
+          for (auto [k, readyOprd] : llvm::enumerate(cmergeOp->getOperands()))
+            if (i <= k)
+              constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                       Pin(readyOprd, SignalType::READY), vr);
       })
       .Case<handshake::MergeOp>([&](handshake::MergeOp mergeOp) {
         // There is a path between every valid input pin and the data output
@@ -256,6 +285,12 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
         Pin output(mergeOp.getResult(), SignalType::DATA);
         for (Value oprd : mergeOp->getOperands())
           constraints.emplace_back(Pin(oprd, SignalType::VALID), output, vd);
+        
+        double vr = unitModel ? unitModel->validToReady : 0.0;
+        for (Value oprd : mergeOp->getOperands())
+          for (Value readyOprd : mergeOp->getOperands())
+            constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                     Pin(readyOprd, SignalType::READY), vr);
       })
       .Case<handshake::MuxOp>([&](handshake::MuxOp muxOp) {
         // There is a path between the data pin of the select operand and every

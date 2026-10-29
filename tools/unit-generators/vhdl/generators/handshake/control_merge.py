@@ -5,6 +5,7 @@ from generators.support.signal_manager.utils.generation import generate_concat_a
 from generators.support.signal_manager.utils.types import ExtraSignals
 from generators.handshake.buffers.one_slot_break_r import generate_one_slot_break_r
 from generators.handshake.fork import generate_fork
+from generators.handshake.lazy_fork import generate_lazy_fork
 # TODO: Update the normal merge to merge_notehb
 from generators.handshake.merge_notehb import generate_merge_notehb
 from generators.support.utils import data
@@ -20,8 +21,13 @@ def generate_control_merge(name, params):
     # e.g., {"tag0": 8, "spec": 1}
     extra_signals = params["extra_signals"]
 
+    # --lazy-forks variant
+    lazy_forks = params["lazy_forks"]
+
     if extra_signals:
         return _generate_control_merge_signal_manager(name, size, index_bitwidth, data_bitwidth, extra_signals)
+    elif lazy_forks:
+        return _generate_control_merge_lazy(name, size, index_bitwidth, data_bitwidth)
     else:
         return _generate_control_merge(name, size, index_bitwidth, data_bitwidth)
 
@@ -124,6 +130,91 @@ end architecture;
 
     return dependencies + entity + architecture
 
+def _generate_control_merge_lazy(name, size, index_bitwidth, data_bitwidth):
+    merge_name = f"{name}_merge"
+    lazy_fork_name = f"{name}_lazy_fork"
+
+    dependencies = generate_merge_notehb(merge_name, {"size": size, "bitwidth": data_bitwidth}) + \
+        generate_lazy_fork(lazy_fork_name, {"size": 2, "bitwidth": 0})
+
+    entity = f"""
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.types.all;
+
+-- Entity of control_merge (--lazy-forks variant)
+entity {name} is
+  port (
+    clk : in std_logic;
+    rst : in std_logic;
+    -- input channels
+    {data(f"ins       : in  data_array({size} - 1 downto 0)({data_bitwidth} - 1 downto 0);", data_bitwidth)}
+    ins_valid : in  std_logic_vector({size} - 1 downto 0);
+    ins_ready : out std_logic_vector({size} - 1 downto 0);
+    -- data output channel
+    {data(f"outs       : out std_logic_vector({data_bitwidth} - 1 downto 0);", data_bitwidth)}
+    outs_valid : out std_logic;
+    outs_ready : in  std_logic;
+    -- index output channel
+    index       : out std_logic_vector({index_bitwidth} - 1 downto 0);
+    index_valid : out std_logic;
+    index_ready : in  std_logic
+  );
+end entity;
+"""
+
+    architecture = f"""
+-- Architecture of control_merge (--lazy-forks variant): merge_ins is wired
+-- directly into a lazy fork, with no TEHB in between, unlike the default
+-- RTL's merge_ins -> one_slot_break_r -> fork chain.
+architecture arch of {name} is
+  {data(f"signal merge_outs : std_logic_vector({data_bitwidth} - 1 downto 0);", data_bitwidth)}
+  signal merge_outs_valid : std_logic;
+  signal fork_ins_ready : std_logic;
+  signal index_internal : std_logic_vector({index_bitwidth} - 1 downto 0);
+begin
+  process (ins_valid)
+  begin
+    index_internal <= ({index_bitwidth} - 1 downto 0 => '0');
+    for i in 0 to ({size} - 1) loop
+      if (ins_valid(i) = '1') then
+        index_internal <= std_logic_vector(to_unsigned(i, {index_bitwidth}));
+        exit;
+      end if;
+    end loop;
+  end process;
+
+  index <= index_internal;
+  {data("outs <= merge_outs;", data_bitwidth)}
+
+  merge_ins : entity work.{merge_name}(arch)
+    port map(
+      clk => clk,
+      rst => rst,
+      {data("ins => ins,", data_bitwidth)}
+      ins_valid => ins_valid,
+      ins_ready => ins_ready,
+      {data("outs => merge_outs,", data_bitwidth)}
+      outs_valid => merge_outs_valid,
+      outs_ready => fork_ins_ready
+    );
+
+  lazy_fork : entity work.{lazy_fork_name}(arch)
+    port map(
+      clk => clk,
+      rst => rst,
+      ins_valid => merge_outs_valid,
+      ins_ready => fork_ins_ready,
+      outs_valid(0) => outs_valid,
+      outs_valid(1) => index_valid,
+      outs_ready(0) => outs_ready,
+      outs_ready(1) => index_ready
+    );
+end architecture;
+"""
+
+    return dependencies + entity + architecture
 
 # TODO: Update CMerge's type constraints and remove this function
 def _generate_index_extra_signal_assignments(index_name: str, index_extra_signals: ExtraSignals) -> str:
@@ -142,7 +233,7 @@ def _generate_index_extra_signal_assignments(index_name: str, index_extra_signal
     return "\n  ".join(index_extra_signals_list)
 
 
-def _generate_control_merge_signal_manager(name, size, index_bitwidth, data_bitwidth, extra_signals):
+def _generate_control_merge_signal_manager(name, size, index_bitwidth, data_bitwidth, extra_signals, lazy_forks):
     # Generate signal manager entity
     entity = generate_entity(
         name,
@@ -168,8 +259,12 @@ def _generate_control_merge_signal_manager(name, size, index_bitwidth, data_bitw
     extra_signals_bitwidth = concat_layout.total_bitwidth
 
     inner_name = f"{name}_inner"
-    inner = _generate_control_merge(
-        inner_name, size, index_bitwidth, extra_signals_bitwidth + data_bitwidth)
+    if lazy_forks:
+        inner = _generate_control_merge_lazy(
+            inner_name, size, index_bitwidth, extra_signals_bitwidth + data_bitwidth)
+    else:
+        inner = _generate_control_merge(
+            inner_name, size, index_bitwidth, extra_signals_bitwidth + data_bitwidth)
 
     assignments = []
 

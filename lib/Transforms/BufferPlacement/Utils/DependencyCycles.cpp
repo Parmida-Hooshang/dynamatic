@@ -76,8 +76,10 @@ static ComponentKind getComponentKind(Operation *op) {
     return ComponentKind::IndependentChannels;
   if (isa<handshake::MuxOp>(op))
     return ComponentKind::Mux;
-  if (auto cmergeOp = dyn_cast<handshake::ControlMergeOp>(op))
-    return ComponentKind::ControlMerge;
+  if (auto cmergeOp = dyn_cast<handshake::ControlMergeOp>(op)) {
+    return cmergeOp->hasAttr("handshake.lazy_forks") ? ComponentKind::ControlMerge
+                                                   : ComponentKind::FullBreak;
+  }
   if (isa<handshake::SelectOp>(op))
     return ComponentKind::Select;
   return ComponentKind::Generic;
@@ -248,7 +250,6 @@ static void addMuxInternalEdges(StringRef id, unsigned numIns,
 }
 
 /// Assuming ControlMerge has no internal registers.
-/// TODO: Add a lazy implementation for control merge.
 static void addControlMergeInternalEdges(StringRef id, SignalGraph &sig) {
   std::string resultValid = getSignalId(id, false, true, 0);
   std::string resultReady = getSignalId(id, false, false, 0);

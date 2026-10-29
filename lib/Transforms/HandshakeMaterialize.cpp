@@ -142,6 +142,12 @@ static void promoteAllForksToLazy(handshake::FuncOp funcOp) {
     forkOp->replaceAllUsesWith(lazyForkOp->getResults());
     forkOp->erase();
   }
+
+  // Tag every control merge so that RTL export instantiates the --lazy-forks
+  // variant.
+  for (handshake::ControlMergeOp cmergeOp :
+       funcOp.getOps<handshake::ControlMergeOp>())
+    cmergeOp->setAttr("handshake.lazy_forks", builder.getUnitAttr());
 }
 
 /// Promotes some eager forks to lazy forks to ensure that different group
