@@ -574,6 +574,7 @@ ModuleDiscriminator::ModuleDiscriminator(Operation *op) {
         addUnsigned("SIZE", cmergeOp.getDataOperands().size());
         addType("DATA_TYPE", cmergeOp.getResult());
         addType("INDEX_TYPE", cmergeOp.getIndex());
+        addBoolean("LAZY_FORKS", cmergeOp->hasAttr("handshake.lazy_forks"));
       })
       .Case<handshake::MergeOp>([&](auto) {
         // Number of input data channels and data bitwidth

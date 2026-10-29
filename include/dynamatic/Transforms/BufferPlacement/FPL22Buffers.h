@@ -25,7 +25,9 @@
 #include "dynamatic/Transforms/BufferPlacement/Utils/BufferPlacementMILP.h"
 #include "dynamatic/Transforms/BufferPlacement/Utils/BufferingSupport.h"
 #include "dynamatic/Transforms/BufferPlacement/Utils/CFDFC.h"
+#include "dynamatic/Transforms/BufferPlacement/Utils/DependencyCycles.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace dynamatic {
 namespace buffer {
@@ -93,12 +95,16 @@ public:
   CFDFCUnionBuffers(CPSolver::SolverKind solverKind, int timeout,
                     FuncInfo &funcInfo, const TimingDatabase &timingDB,
                     double targetPeriod, CFDFCUnion &cfUnion,
+                    const buffer::DependencyGraph &depGraph,
                     StringRef writeTo);
 
 private:
   /// The CFDFC union over which the MILP is described. Constraints are only
   /// created over the channels and units that are part of this union.
   CFDFCUnion &cfUnion;
+
+  /// The circuit-wide dependency graph (shared across every MILP instance).
+  const buffer::DependencyGraph &depGraph;
 
   /// Setups the entire MILP, creating all variables, constraints, and setting
   /// the system's objective. Called by the constructor in the absence of prior
@@ -132,10 +138,15 @@ public:
                              FuncInfo &funcInfo,
                              const TimingDatabase &timingDB,
                              double targetPeriod,
+                             const buffer::SignalGraph &sigGraph,
                              const BufferPlacement &priorPlacement,
                              StringRef writeTo);
 
 private:
+  /// The circuit-wide signal graph, each node is a handshake port and
+  /// each edge is a dependency.
+  const buffer::SignalGraph &sigGraph;
+  
   /// The buffer placement decisions already made by the earlier MILPs,
   /// so this step only ever adds buffers, never removes them.
   const BufferPlacement &priorPlacement;

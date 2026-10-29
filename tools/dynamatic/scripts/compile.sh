@@ -26,7 +26,17 @@ ENABLE_SHORT_CIRCUIT=${16}
 ENABLE_DUPLICATION=${17:-0}
 CALCULATE_PATH_DELAYS=${18}
 INSTRUMENT_II=${19}
-USE_LSQ_SIZING=${20:-0}
+INSTANTIATE_BUFFERS=${20:-0}
+LAZY_FORKS=${21:-0}
+USE_LSQ_SIZING=${22:-0}
+
+# When --lazy-forks converts every fork to lazy, skip fpga20-style buffering
+# properties.
+if [[ "$LAZY_FORKS" == "1" ]]; then
+  SET_BUFFERING_PROPS_FLAG=""
+else
+  SET_BUFFERING_PROPS_FLAG="--handshake-set-buffering-properties=version=fpga20"
+fi
 
 LLVM=$DYNAMATIC_DIR/llvm-project
 DYNAMATIC_BINS=$DYNAMATIC_DIR/bin
@@ -363,7 +373,9 @@ if [[ $STRAIGHT_TO_QUEUE -ne 0 ]]; then
   "$DYNAMATIC_OPT_BIN" "$F_HANDSHAKE" \
     --handshake-remove-unused-memrefs \
     --handshake-optimize-bitwidths \
-    --handshake-materialize --handshake-infer-basic-blocks \
+    --handshake-materialize="instantiate-buffers=$INSTANTIATE_BUFFERS lazy-forks=$LAZY_FORKS" \
+    --handshake-infer-basic-blocks \
+    ${SET_BUFFERING_PROPS_FLAG:+"$SET_BUFFERING_PROPS_FLAG"} \
     > "$F_HANDSHAKE_TRANSFORMED"
   exit_on_fail "Failed to apply transformations to handshake" \
     "Applied transformations to handshake"
@@ -375,7 +387,9 @@ else
     --handshake-deactivate-mem-dependencies --handshake-replace-memory-interfaces \
     --handshake-remove-unused-memrefs \
     --handshake-optimize-bitwidths \
-    --handshake-materialize --handshake-infer-basic-blocks \
+    --handshake-materialize="instantiate-buffers=$INSTANTIATE_BUFFERS lazy-forks=$LAZY_FORKS" \
+    --handshake-infer-basic-blocks \
+    ${SET_BUFFERING_PROPS_FLAG:+"$SET_BUFFERING_PROPS_FLAG"} \
     > "$F_HANDSHAKE_TRANSFORMED"
   exit_on_fail "Failed to apply transformations to handshake" \
     "Applied transformations to handshake"
@@ -385,7 +399,8 @@ fi
 if [[ "$SPECULATION" == "1" ]]; then
   "$DYNAMATIC_OPT_BIN" "$F_HANDSHAKE_TRANSFORMED" \
     --handshake-speculation \
-    --handshake-materialize \
+    --handshake-materialize ="instantiate-buffers=$INSTANTIATE_BUFFERS lazy_forks=$LAZY_FORKS" \
+    ${SET_BUFFERING_PROPS_FLAG:+"$SET_BUFFERING_PROPS_FLAG"} \
     > "$F_HANDSHAKE_SPECULATION"
   exit_on_fail "Failed to add speculative units" "Added speculative units"
   F_HANDSHAKE_TRANSFORMED="$F_HANDSHAKE_SPECULATION"
@@ -414,7 +429,6 @@ if [[ "$BUFFER_ALGORITHM" == "on-merges" ]]; then
   echo_info "Running simple buffer placement (on-merges)."
   "$DYNAMATIC_OPT_BIN" "$F_HANDSHAKE_TRANSFORMED" \
     --handshake-set-unit-impl-attr="target-period=$TARGET_CP timing-models=$DYNAMATIC_DIR/data/components.json impl=$FPUNITS_GEN" \
-    --handshake-set-buffering-properties="version=fpga20" \
     --handshake-place-buffers="algorithm=$BUFFER_ALGORITHM solver=$MILP_SOLVER timing-models=$DYNAMATIC_DIR/data/components.json" \
     ${LSQ_SIZING_PASS:+"$LSQ_SIZING_PASS"} \
     ${SHARING_PASS:+"$SHARING_PASS"} \
@@ -450,7 +464,6 @@ else
   # out the value of <DEBUG_TYPE> in the cpp source files.
   "$DYNAMATIC_OPT_BIN" "$F_HANDSHAKE_TRANSFORMED" \
     --handshake-set-unit-impl-attr="target-period=$TARGET_CP timing-models=$DYNAMATIC_DIR/data/components.json impl=$FPUNITS_GEN" \
-    --handshake-set-buffering-properties="version=fpga20" \
     --handshake-place-buffers="algorithm=$BUFFER_ALGORITHM solver=$MILP_SOLVER frequencies=$F_FREQUENCIES timing-models=$DYNAMATIC_DIR/data/components.json spec-timing-models=$DYNAMATIC_DIR/data/spec-timing.json target-period=$TARGET_CP timeout=300 dump-milp-models $CALCULATE_PATH_DELAYS_FLAG ftd=$FAST_TOKEN_DELIVERY \
     blif-files=$DYNAMATIC_DIR/data/aig/ lut-delay=0.55 lut-size=6 acyclic-type" \
     ${LSQ_SIZING_PASS:+"$LSQ_SIZING_PASS"} \
@@ -467,7 +480,7 @@ fi
 # canonicalize
 "$DYNAMATIC_OPT_BIN" "$F_HANDSHAKE_BUFFERED" \
   --handshake-spec-post-buffer \
-  --handshake-materialize \
+  --handshake-materialize="instantiate-buffers=$INSTANTIATE_BUFFERS lazy-forks=$LAZY_FORKS" \
   --handshake-canonicalize \
   --handshake-hoist-ext-instances \
   > "$F_HANDSHAKE_EXPORT"

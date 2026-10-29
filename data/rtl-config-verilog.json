@@ -783,11 +783,31 @@
         "extra-eq": 0,
         "generic": false
       },
-      { "name": "INDEX_TYPE", "type": "dataflow", "data-lb": 1, "extra-eq": 0 }
+      { "name": "INDEX_TYPE", "type": "dataflow", "data-lb": 1, "extra-eq": 0 },
+      { "name": "LAZY_FORKS", "type": "boolean", "eq": false, "generic": false }
     ],
     "generic": "$DYNAMATIC/data/verilog/handshake/dataless/control_merge.v",
     "module-name": "control_merge_dataless",
     "dependencies": ["merge_dataless", "tehb", "fork_dataless"],
+    "hdl": "verilog"
+  },
+  {
+    "name": "handshake.control_merge",
+    "parameters": [
+      { "name": "SIZE", "type": "unsigned", "lb": 1 },
+      {
+        "name": "DATA_TYPE",
+        "type": "dataflow",
+        "data-eq": 0,
+        "extra-eq": 0,
+        "generic": false
+      },
+      { "name": "INDEX_TYPE", "type": "dataflow", "data-lb": 1, "extra-eq": 0 },
+      { "name": "LAZY_FORKS", "type": "boolean", "eq": true, "generic": false }
+    ],
+    "generic": "$DYNAMATIC/data/verilog/handshake/dataless/control_merge_lazy.v",
+    "module-name": "control_merge_dataless",
+    "dependencies": ["merge_dataless", "lazy_fork_dataless"],
     "hdl": "verilog"
   },
   {

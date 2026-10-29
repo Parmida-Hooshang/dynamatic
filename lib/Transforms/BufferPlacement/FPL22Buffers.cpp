@@ -242,12 +242,41 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
             addJoinedOprdConstraints();
           })
       .Case<handshake::ControlMergeOp>([&](handshake::ControlMergeOp cmergeOp) {
-        // There is a path between the valid pin of the first operand and the
-        // data pin of the index result
-        Pin input(cmergeOp.getOperand(0), SignalType::VALID);
-        Pin output(cmergeOp.getIndex(), SignalType::DATA);
         double vc = unitModel ? unitModel->validToCond : 0.0;
-        constraints.emplace_back(input, output, vc);
+        double vr = unitModel ? unitModel->validToReady : 0.0;
+
+        if (cmergeOp->hasAttr("handshake.lazy_forks")) {
+          for (auto [i, oprd] : llvm::enumerate(cmergeOp->getOperands()))
+            for (auto [k, readyOprd] : llvm::enumerate(cmergeOp->getOperands()))
+              if (i <= k)
+                constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                         Pin(readyOprd, SignalType::READY), vr);
+
+          for (Value oprd : cmergeOp->getOperands())
+            constraints.emplace_back(
+                Pin(oprd, SignalType::VALID),
+                Pin(cmergeOp.getIndex(), SignalType::DATA), vc);
+
+          // Internal lazy fork.
+          constraints.emplace_back(
+              Pin(cmergeOp.getIndex(), SignalType::READY),
+              Pin(cmergeOp.getResult(), SignalType::VALID), 0.0);
+          constraints.emplace_back(
+              Pin(cmergeOp.getResult(), SignalType::READY),
+              Pin(cmergeOp.getIndex(), SignalType::VALID), 0.0);
+          return;
+        }
+
+        for (Value oprd : cmergeOp->getOperands())
+            constraints.emplace_back(
+                Pin(oprd, SignalType::VALID),
+                Pin(cmergeOp.getIndex(), SignalType::DATA), vc);
+
+        for (auto [i, oprd] : llvm::enumerate(cmergeOp->getOperands()))
+          for (auto [k, readyOprd] : llvm::enumerate(cmergeOp->getOperands()))
+            if (i <= k)
+              constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                       Pin(readyOprd, SignalType::READY), vr);
       })
       .Case<handshake::MergeOp>([&](handshake::MergeOp mergeOp) {
         // There is a path between every valid input pin and the data output
@@ -256,6 +285,12 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
         Pin output(mergeOp.getResult(), SignalType::DATA);
         for (Value oprd : mergeOp->getOperands())
           constraints.emplace_back(Pin(oprd, SignalType::VALID), output, vd);
+        
+        double vr = unitModel ? unitModel->validToReady : 0.0;
+        for (Value oprd : mergeOp->getOperands())
+          for (Value readyOprd : mergeOp->getOperands())
+            constraints.emplace_back(Pin(oprd, SignalType::VALID),
+                                     Pin(readyOprd, SignalType::READY), vr);
       })
       .Case<handshake::MuxOp>([&](handshake::MuxOp muxOp) {
         // There is a path between the data pin of the select operand and every
@@ -274,6 +309,20 @@ void FPL22BuffersBase::addUnitMixedPathConstraints(Operation *unit,
           for (Value readyOprd : muxOp->getOperands()) {
             constraints.emplace_back(Pin(oprd, SignalType::VALID),
                                      Pin(readyOprd, SignalType::READY), vr);
+          }
+        }
+      })
+      .Case<handshake::LazyForkOp>([&](handshake::LazyForkOp lazyForkOp) {
+        // A lazy fork only raises an output's valid once every other
+        // output's ready is high, so there is a path between the ready
+        // pin of every output and the valid pin of every other output
+        for (OpResult outValid : lazyForkOp->getResults()) {
+          for (OpResult outReady : lazyForkOp->getResults()) {
+            if (outValid == outReady)
+              continue;
+            // 0.0 should be replaced with the correct value
+            constraints.emplace_back(Pin(outReady, SignalType::READY),
+                                     Pin(outValid, SignalType::VALID), 0.0);
           }
         }
       })
@@ -312,10 +361,11 @@ CFDFCUnionBuffers::CFDFCUnionBuffers(CPSolver::SolverKind solverKind,
                                      int timeout, FuncInfo &funcInfo,
                                      const TimingDatabase &timingDB,
                                      double targetPeriod, CFDFCUnion &cfUnion,
+                                     const buffer::DependencyGraph &depGraph,
                                      StringRef writeTo)
     : FPL22BuffersBase(solverKind, timeout, funcInfo, timingDB, targetPeriod,
                        writeTo),
-      cfUnion(cfUnion) {
+      cfUnion(cfUnion), depGraph(depGraph) {
   if (!unsatisfiable)
     setup();
 }
@@ -400,6 +450,18 @@ void CFDFCUnionBuffers::setup() {
     addUnitThroughputConstraints(*cfdfc);
   }
 
+  // Rank (dependency order) constraints for dependency cycles contained in 
+  // this union.
+  buffer::SignalGraph unionSigGraph;
+  buffer::buildSignalGraph(
+      depGraph, unionSigGraph,
+      [&](Operation *op) { return op && cfUnion.units.contains(op); },
+      channelFilter);
+  buffer::addDependencyRankConstraints(
+      unionSigGraph, *model, [&](Value channel) -> CPVar & {
+        return vars.channelVars[channel].bufNumSlots;
+      });
+
   // Add the MILP objective and mark the MILP ready to be optimized
   std::vector<Value> allChannels;
   llvm::copy(cfUnion.channels, std::back_inserter(allChannels));
@@ -410,9 +472,11 @@ void CFDFCUnionBuffers::setup() {
 NonCFDFCBuffers::NonCFDFCBuffers(
     CPSolver::SolverKind solverKind, int timeout, FuncInfo &funcInfo,
     const TimingDatabase &timingDB, double targetPeriod,
+    const buffer::SignalGraph &sigGraph,
     const BufferPlacement &priorPlacement, StringRef writeTo)
     : FPL22BuffersBase(solverKind, timeout, funcInfo, timingDB, targetPeriod,
-                       writeTo), priorPlacement(priorPlacement) {
+                       writeTo), 
+                       sigGraph(sigGraph), priorPlacement(priorPlacement) {
   if (!unsatisfiable)
     setup();
 }
@@ -524,6 +588,15 @@ void NonCFDFCBuffers::setup() {
     objective -= readyBuf;
     objective -= 0.1 * chVars.bufNumSlots;
   }
+
+  // Rank constraints enforcing every dependency cycle to have at least
+  // one buffered ready edge. This one is allowed to place a buffer even
+  // inside CFDFCs, because in that case it only places tfifo slots (fast
+  // and transparent) which do not damage throughput.
+  buffer::addDependencyRankConstraints(
+      sigGraph, *model, [&](Value channel) -> CPVar & {
+        return vars.channelVars[channel].bufNumSlots;
+      });
 
   // Unit path constraints (single-domain and mixed-domain) over all three
   // signal domains.

@@ -46,6 +46,22 @@ using namespace dynamatic;
 using namespace dynamatic::buffer;
 using namespace dynamatic::handshake;
 
+/// Returns whether a buffer type breaks the ready signal.
+static bool breaksReadyPath(BufferType bufferType) {
+  switch (bufferType) {
+  case BufferType::ONE_SLOT_BREAK_R:
+  case BufferType::ONE_SLOT_BREAK_DVR:
+  case BufferType::COUNTER_BUFFER:
+    return true;
+  case BufferType::ONE_SLOT_BREAK_DV:
+  case BufferType::FIFO_BREAK_DV:
+  case BufferType::FIFO_BREAK_NONE:
+  case BufferType::SHIFT_REG_BREAK_DV:
+    return false;
+  }
+  llvm_unreachable("Unknown BufferType in breaksReadyPath()");
+}
+
 /// Returns a textual name for a signal type.
 static StringRef getSignalName(SignalType signalType) {
   switch (signalType) {
@@ -495,14 +511,18 @@ void BufferPlacementMILP::addCFDFCVars(CFDFC &cfdfc) {
       // (since the occupancy of that path is related
       // to its latency)
 
-      // try get the latency from the timingDB
-      auto pathLatencyOrFail =
-          timingDB.getLatency(unit, SignalType::DATA, targetPeriod, pathIdx);
-      if (succeeded(pathLatencyOrFail))
-        pathVars.latency = *pathLatencyOrFail;
-      else
-        // assume latency 0 if the timing model fails
-        pathVars.latency = 0.0;
+      if (auto bufOp = dyn_cast<handshake::BufferOp>(unit)) {
+        pathVars.latency = bufOp.getLatencyDV();
+      } else {
+        // try get the latency from the timingDB
+        auto pathLatencyOrFail =
+            timingDB.getLatency(unit, SignalType::DATA, targetPeriod, pathIdx);
+        if (succeeded(pathLatencyOrFail))
+          pathVars.latency = *pathLatencyOrFail;
+        else
+          // assume latency 0 if the timing model fails
+          pathVars.latency = 0.0;
+      }
 
       // and we need to create retiming variables for the unit
       // for the MILP to move channel occupancy around
@@ -619,6 +639,18 @@ void BufferPlacementMILP::addChannelTimingConstraints(
 void BufferPlacementMILP::addUnitTimingConstraints(Operation *unit,
                                                    SignalType signalType,
                                                    ChannelFilter filter) {
+
+  // Buffers which are already instantiated break the combinational path
+  // on specific signals, so there is then no combinational relationship
+  // between their input and output arrival times.
+  if (auto bufOp = dyn_cast<handshake::BufferOp>(unit)) {
+    bool breaksThisSignal = signalType == SignalType::READY
+                                ? breaksReadyPath(bufOp.getBufferType())
+                                : !bufOp.isBypassDV();
+    if (breaksThisSignal)
+      return;
+  }
+
   // Add path constraints for units
   double latency = 0.0;
   auto latencyOrFail = timingDB.getLatency(unit, signalType, targetPeriod);

@@ -310,6 +310,9 @@ public:
   static constexpr llvm::StringLiteral CALCULATE_PATH_DELAYS =
       "calculate-path-delays";
   static constexpr llvm::StringLiteral INSTRUMENT_II = "instrument-ii";
+    static constexpr llvm::StringLiteral INSTANTIATE_BUFFERS =
+      "instantiate-buffers";
+  static constexpr llvm::StringLiteral LAZY_FORKS = "lazy-forks";
   static constexpr llvm::StringLiteral LSQ_SIZING = "lsq-sizing";
 
   Compile(FrontendState &state)
@@ -357,6 +360,19 @@ public:
     addFlag({INSTRUMENT_II,
              "Instrument the generated netlist so that each loop reports "
              "the initiation of each of its iterations during simulation"});
+    addFlag({INSTANTIATE_BUFFERS,
+             "Instantiate LSQ/Store-Load/Speculator correctness buffering "
+             "requirements as actual buffers directly in the IR during "
+             "materialization, instead of setting them as buffer-placement "
+             "MILP constraints (the default, pre-instantiation behavior)."});
+    addFlag({LAZY_FORKS,
+             "Convert every remaining eager fork into an equivalent lazy "
+             "fork (instead of only the LSQ group-allocation control forks "
+             "that strictly need it), and skip "
+             "--handshake-set-buffering-properties entirely. Intended for "
+             "experimentation: the resulting circuit may have new, "
+             "unprotected combinational ready-cycle risks outside the LSQ "
+             "control network, and generally worse throughput."});
     addFlag({LSQ_SIZING,
              "Size the load and store queues of the LSQs from the CFDFCs "
              "found by buffer placement (requires an MILP-based buffer "
@@ -808,6 +824,9 @@ CommandResult Compile::execute(CommandArguments &args) {
   std::string calculatePathDelays =
       args.flags.contains(CALCULATE_PATH_DELAYS) ? "1" : "0";
   std::string instrumentII = args.flags.contains(INSTRUMENT_II) ? "1" : "0";
+  std::string instantiateBuffers =
+      args.flags.contains(INSTANTIATE_BUFFERS) ? "1" : "0";
+  std::string lazyForks = args.flags.contains(LAZY_FORKS) ? "1" : "0";
   std::string lsqSizing = args.flags.contains(LSQ_SIZING) ? "1" : "0";
 
   return execCmd(script, state.dynamaticPath, state.getKernelDir(),
@@ -816,7 +835,7 @@ CommandResult Compile::execute(CommandArguments &args) {
                  state.fpUnitsGenerator, rigidification, kInduction, disableLSQ,
                  fastTokenDelivery, milpSolver, straightToQueue, speculation,
                  enableShortCircuit, enableDuplication, calculatePathDelays,
-                 instrumentII, lsqSizing);
+                 instrumentII, instantiateBuffers, lazyForks, lsqSizing);
 }
 
 CommandResult WriteHDL::execute(CommandArguments &args) {
