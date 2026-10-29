@@ -1,21 +1,37 @@
 `timescale 1ns/1ps
-// trueValue is selected when condition = 1, falseValue when condition = 0.
-// When the selector fires with one value while the token of the other value has
-// not arrived yet, that token is owed to be killed when it arrives. Kills are
-// owed to at most one of trueValue and falseValue at a time: a condition
-// selecting a value waits at the head of the condition channel until all kills
-// owed to that value are done, so the next token of that value is the one it
-// selects.
-//   NORMAL     : no kill owed (cnt = 0)
-//   KILL_TRUE  : cnt trueValue tokens owed to be killed, falseValue may run ahead
-//   KILL_FALSE : cnt falseValue tokens owed to be killed, trueValue may run ahead
-// ANTITOKEN_DEPTH is the maximum number of kills owed to trueValue or
-// falseValue, i.e., how far one of them may run ahead of the other. With 0, the
-// selector waits for the condition and both data inputs, and consumes all
-// three when the result is produced (join).
+
+module tbf_dataless (
+  input  clk,
+  input  rst,
+  // Input channel
+  input  ins_valid,
+  output ins_ready,
+  // Output channel
+  output outs_valid,
+  input  outs_ready,
+  // Slot occupancy (not needed by tfifo_dataless, used by selector)
+  output is_full
+);
+
+  reg full = 1'b0;
+  assign is_full = full;
+
+  always @(posedge clk) begin
+    if (rst) begin
+      full <= 1'b0;
+    end
+    else begin
+      full <= (~outs_ready & ins_valid) | (full & ins_valid) | (full & ~outs_ready);
+    end
+  end
+
+  assign outs_valid = full | ins_valid;
+  assign ins_ready = ~full | outs_ready;
+
+endmodule
+
 module selector #(
-  parameter DATA_TYPE = 32,
-  parameter ANTITOKEN_DEPTH = 1
+  parameter DATA_TYPE = 32
 )(
   // inputs
   input  clk,
@@ -34,110 +50,56 @@ module selector #(
   output  trueValue_ready,
   output  falseValue_ready
 );
-  generate
-    if (ANTITOKEN_DEPTH == 0) begin : gen_join
-      wire allValid, fire;
 
-      assign allValid = condition_valid & trueValue_valid & falseValue_valid;
-      assign fire = allValid & result_ready;
+  // Each data input has a one-slot antitoken store (a tbf). An antitoken is
+  // pushed when the select fires without that input's token, and popped when
+  // the discarded token arrives. Since the tbf can pop and push in the same
+  // cycle, the select can fire again in the cycle the previous discarded token
+  // arrives, instead of stalling one cycle to clear the antitoken.
+  wire ee, validInternal, antitokenStop, g0, g1;
+  wire kill0, kill1, full0, full1, atReady0, atReady1;
+  wire trueValid, falseValid;
 
-      assign result_valid = allValid;
-      assign trueValue_ready = !trueValue_valid | fire;
-      assign falseValue_ready = !falseValue_valid | fire;
-      assign condition_ready = !condition_valid | fire;
-    end else begin : gen_fsm
-      localparam NORMAL = 2'd0, KILL_TRUE = 2'd1, KILL_FALSE = 2'd2;
-      localparam CNT_WIDTH = $clog2(ANTITOKEN_DEPTH + 1);
+  // While an antitoken is pending on an input, the token arriving there is the
+  // discarded one: it is killed and must not be used.
+  assign trueValid = trueValue_valid & !full0;
+  assign falseValid = falseValue_valid & !full1;
 
-      reg [1 : 0] state = NORMAL;
-      reg [CNT_WIDTH-1 : 0] cnt = 0;
+  // condition and one input
+  assign ee = condition_valid & ( ( !condition & falseValid) | (condition & trueValid) );
+  // Stop if firing would need to push an antitoken into a full store that is
+  // not popped this cycle
+  assign antitokenStop = !atReady0 | !atReady1;
+  assign validInternal = ee & !antitokenStop;
 
-      wire killTrueOwed, killFalseOwed, full;
-      wire selTrue, selFalse, canTrue, canFalse;
-      wire fireTrue, fireFalse, discardTrue, discardFalse;
+  assign g0 = !trueValid & validInternal & result_ready;
+  assign g1 = !falseValid & validInternal & result_ready;
 
-      assign killTrueOwed = (state == KILL_TRUE);
-      assign killFalseOwed = (state == KILL_FALSE);
-      assign full = (cnt == ANTITOKEN_DEPTH);
-
-      assign selTrue = condition_valid & condition;
-      assign selFalse = condition_valid & !condition;
-
-      // Select a value if its next token is not owed a kill, and if firing does
-      // not add a kill to the other value when that one is full
-      assign canTrue = selTrue & trueValue_valid & !killTrueOwed &
-                       !(killFalseOwed & full & !falseValue_valid);
-      assign canFalse = selFalse & falseValue_valid & !killFalseOwed &
-                        !(killTrueOwed & full & !trueValue_valid);
-
-      assign fireTrue = canTrue & result_ready;
-      assign fireFalse = canFalse & result_ready;
-
-      // Kill an arriving token if a kill is owed to its value, or if the other
-      // value is selected in the same cycle (normal join)
-      assign discardTrue = trueValue_valid & (killTrueOwed | fireFalse);
-      assign discardFalse = falseValue_valid & (killFalseOwed | fireTrue);
-
-      assign result_valid = canTrue | canFalse;
-      assign trueValue_ready = !trueValue_valid | fireTrue | discardTrue;
-      assign falseValue_ready = !falseValue_valid | fireFalse | discardFalse;
-      assign condition_ready = !condition_valid | fireTrue | fireFalse;
-
-
-      // State and counter update:
-      //   - NORMAL -> KILL_TRUE with cnt = 1 when falseValue is selected and no
-      //     trueValue token is present to kill in the same cycle.
-      //   - KILL_TRUE: cnt + 1 when falseValue is selected and no trueValue
-      //     token is present, cnt - 1 when a trueValue token is killed and
-      //     falseValue is not selected, unchanged otherwise. Back to NORMAL
-      //     when cnt reaches 0.
-      //   - NORMAL -> KILL_FALSE and KILL_FALSE are symmetric.
-      always @(posedge clk) begin
-        if (rst) begin
-          state <= NORMAL;
-          cnt <= 0;
-        end else begin
-          case (state)
-            NORMAL: begin
-              if (fireFalse & !trueValue_valid) begin
-                state <= KILL_TRUE;
-                cnt <= 1;
-              end else if (fireTrue & !falseValue_valid) begin
-                state <= KILL_FALSE;
-                cnt <= 1;
-              end
-            end
-            KILL_TRUE: begin
-              if (fireFalse & !trueValue_valid) begin
-                cnt <= cnt + 1;
-              end else if (!fireFalse & trueValue_valid) begin
-                cnt <= cnt - 1;
-                // cnt still holds the old value: the last owed token is killed
-                // and cnt becomes 0 together with the move to NORMAL
-                if (cnt == 1)
-                  state <= NORMAL;
-              end
-            end
-            KILL_FALSE: begin
-              if (fireTrue & !falseValue_valid) begin
-                cnt <= cnt + 1;
-              end else if (!fireTrue & falseValue_valid) begin
-                cnt <= cnt - 1;
-                // cnt still holds the old value: the last owed token is killed
-                // and cnt becomes 0 together with the move to NORMAL
-                if (cnt == 1)
-                  state <= NORMAL;
-              end
-            end
-            default: begin
-              state <= NORMAL;
-              cnt <= 0;
-            end
-          endcase
-        end
-      end
-    end
-  endgenerate
+  assign result_valid = validInternal;
+  assign trueValue_ready = !trueValue_valid | (validInternal & result_ready) | kill0; // normal join or antitoken
+  assign falseValue_ready = !falseValue_valid | (validInternal & result_ready) | kill1; // normal join or antitoken
+  assign condition_ready = !condition_valid | (validInternal & result_ready); // normal join
 
   assign result = condition ? trueValue : falseValue;
+
+  tbf_dataless antitoken0 (
+    .clk(clk),
+    .rst(rst),
+    .ins_valid(g0),
+    .ins_ready(atReady0),
+    .outs_valid(kill0),
+    .outs_ready(trueValue_valid),
+    .is_full(full0)
+  );
+
+  tbf_dataless antitoken1 (
+    .clk(clk),
+    .rst(rst),
+    .ins_valid(g1),
+    .ins_ready(atReady1),
+    .outs_valid(kill1),
+    .outs_ready(falseValue_valid),
+    .is_full(full1)
+  );
+
 endmodule

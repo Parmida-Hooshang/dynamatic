@@ -2,63 +2,55 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-entity antitokens is
+-- Entity of tbf (one-slot transparent buffer, dataless), used as an
+-- antitoken store
+entity tbf_dataless is
   port (
-    clk, rst                   : in  std_logic;
-    pvalid1, pvalid0           : in  std_logic;
-    kill1, kill0               : out std_logic;
-    generate_at1, generate_at0 : in  std_logic;
-    stop_valid                 : out std_logic
+    clk, rst   : in  std_logic;
+    -- input channel
+    ins_valid  : in  std_logic;
+    ins_ready  : out std_logic;
+    -- output channel
+    outs_valid : out std_logic;
+    outs_ready : in  std_logic;
+    -- slot occupancy
+    is_full    : out std_logic
   );
-end antitokens;
+end entity;
 
-architecture arch of antitokens is
-  signal reg_in0, reg_in1, reg_out0, reg_out1 : std_logic;
+-- Architecture of tbf
+architecture arch of tbf_dataless is
+  signal full : std_logic;
 begin
 
-  reg0 : process (clk)
+  process (clk)
   begin
     if (rising_edge(clk)) then
       if (rst = '1') then
-        reg_out0 <= '0';
+        full <= '0';
       else
-        reg_out0 <= reg_in0;
+        full <= (not outs_ready and ins_valid) or (full and ins_valid) or (full and not outs_ready);
       end if;
     end if;
-  end process reg0;
+  end process;
 
-  reg1 : process (clk)
-  begin
-    if (rising_edge(clk)) then
-      if (rst = '1') then
-        reg_out1 <= '0';
-      else
-        reg_out1 <= reg_in1;
-      end if;
-    end if;
-  end process reg1;
-
-  reg_in0 <= not pvalid0 and (generate_at0 or reg_out0);
-  reg_in1 <= not pvalid1 and (generate_at1 or reg_out1);
-
-  stop_valid <= reg_out0 or reg_out1;
-
-  kill0 <= generate_at0 or reg_out0;
-  kill1 <= generate_at1 or reg_out1;
+  outs_valid <= full or ins_valid;
+  ins_ready  <= not full or outs_ready;
+  is_full    <= full;
 end architecture;
 
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+-- Entity of selector
 entity selector is
   generic (
     DATA_TYPE : integer
   );
   port (
     -- inputs
-    clk		           : in std_logic;
-    rst              : in std_logic;
+    clk, rst         : in std_logic;
     condition        : in std_logic_vector(0 downto 0);
     condition_valid  : in std_logic;
     trueValue        : in std_logic_vector(DATA_TYPE - 1 downto 0);
@@ -75,18 +67,35 @@ entity selector is
   );
 end entity;
 
+-- Architecture of selector
+-- Each data input has a one-slot antitoken store (a tbf). An antitoken is
+-- pushed when the select fires without that input's token, and popped when
+-- the discarded token arrives. Since the tbf can pop and push in the same
+-- cycle, the select can fire again in the cycle the previous discarded token
+-- arrives, instead of stalling one cycle to clear the antitoken.
 architecture arch of selector is
-  signal ee, validInternal : std_logic;
-  signal kill0, kill1      : std_logic;
-  signal antitokenStop     : std_logic;
-  signal g0, g1            : std_logic;
+  signal ee, validInternal     : std_logic;
+  signal kill0, kill1          : std_logic;
+  signal full0, full1          : std_logic;
+  signal atReady0, atReady1    : std_logic;
+  signal antitokenStop         : std_logic;
+  signal g0, g1                : std_logic;
+  signal trueValid, falseValid : std_logic;
 begin
 
-  ee            <= condition_valid and ((not condition(0) and falseValue_valid) or (condition(0) and trueValue_valid)); --condition(0) and one input
-  validInternal <= ee and not antitokenStop; -- propagate ee if not stopped by antitoken
+  -- While an antitoken is pending on an input, the token arriving there is the
+  -- discarded one: it is killed and must not be used.
+  trueValid  <= trueValue_valid and not full0;
+  falseValid <= falseValue_valid and not full1;
 
-  g0 <= not trueValue_valid and validInternal and result_ready;
-  g1 <= not falseValue_valid and validInternal and result_ready;
+  ee            <= condition_valid and ((not condition(0) and falseValid) or (condition(0) and trueValid)); --condition(0) and one input
+  -- Stop if firing would need to push an antitoken into a full store that is
+  -- not popped this cycle
+  antitokenStop <= not atReady0 or not atReady1;
+  validInternal <= ee and not antitokenStop;
+
+  g0 <= not trueValid and validInternal and result_ready;
+  g1 <= not falseValid and validInternal and result_ready;
 
   result_valid     <= validInternal;
   trueValue_ready  <= (not trueValue_valid) or (validInternal and result_ready) or kill0; -- normal join or antitoken
@@ -96,13 +105,26 @@ begin
   result <= falseValue when (condition(0) = '0') else
             trueValue;
 
-  Antitokens : entity work.antitokens
+  antitoken0 : entity work.tbf_dataless
     port map(
-      clk, rst,
-      falseValue_valid, trueValue_valid,
-      kill1, kill0,
-      g1, g0,
-      antitokenStop
+      clk        => clk,
+      rst        => rst,
+      ins_valid  => g0,
+      ins_ready  => atReady0,
+      outs_valid => kill0,
+      outs_ready => trueValue_valid,
+      is_full    => full0
+    );
+
+  antitoken1 : entity work.tbf_dataless
+    port map(
+      clk        => clk,
+      rst        => rst,
+      ins_valid  => g1,
+      ins_ready  => atReady1,
+      outs_valid => kill1,
+      outs_ready => falseValue_valid,
+      is_full    => full1
     );
 
 end architecture;
