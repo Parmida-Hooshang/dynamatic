@@ -326,10 +326,11 @@ CFDFCUnionBuffers::CFDFCUnionBuffers(CPSolver::SolverKind solverKind,
                                      int timeout, FuncInfo &funcInfo,
                                      const TimingDatabase &timingDB,
                                      double targetPeriod, CFDFCUnion &cfUnion,
+                                     const buffer::DependencyGraph &depGraph,
                                      StringRef writeTo)
     : FPL22BuffersBase(solverKind, timeout, funcInfo, timingDB, targetPeriod,
                        writeTo),
-      cfUnion(cfUnion) {
+      cfUnion(cfUnion), depGraph(depGraph) {
   if (!unsatisfiable)
     setup();
 }
@@ -414,6 +415,18 @@ void CFDFCUnionBuffers::setup() {
     addUnitThroughputConstraints(*cfdfc);
   }
 
+  // Rank (dependency order) constraints for dependency cycles contained in 
+  // this union.
+  buffer::SignalGraph unionSigGraph;
+  buffer::buildSignalGraph(
+      depGraph, unionSigGraph,
+      [&](Operation *op) { return op && cfUnion.units.contains(op); },
+      channelFilter);
+  buffer::addDependencyRankConstraints(
+      unionSigGraph, *model, [&](Value channel) -> CPVar & {
+        return vars.channelVars[channel].bufNumSlots;
+      });
+
   // Add the MILP objective and mark the MILP ready to be optimized
   std::vector<Value> allChannels;
   llvm::copy(cfUnion.channels, std::back_inserter(allChannels));
@@ -424,9 +437,11 @@ void CFDFCUnionBuffers::setup() {
 NonCFDFCBuffers::NonCFDFCBuffers(
     CPSolver::SolverKind solverKind, int timeout, FuncInfo &funcInfo,
     const TimingDatabase &timingDB, double targetPeriod,
+    const buffer::SignalGraph &sigGraph,
     const BufferPlacement &priorPlacement, StringRef writeTo)
     : FPL22BuffersBase(solverKind, timeout, funcInfo, timingDB, targetPeriod,
-                       writeTo), priorPlacement(priorPlacement) {
+                       writeTo), 
+                       sigGraph(sigGraph), priorPlacement(priorPlacement) {
   if (!unsatisfiable)
     setup();
 }
@@ -538,6 +553,15 @@ void NonCFDFCBuffers::setup() {
     objective -= readyBuf;
     objective -= 0.1 * chVars.bufNumSlots;
   }
+
+  // Rank constraints enforcing every dependency cycle to have at least
+  // one buffered ready edge. This one is allowed to place a buffer even
+  // inside CFDFCs, because in that case it only places tfifo slots (fast
+  // and transparent) which do not damage throughput.
+  buffer::addDependencyRankConstraints(
+      sigGraph, *model, [&](Value channel) -> CPVar & {
+        return vars.channelVars[channel].bufNumSlots;
+      });
 
   // Unit path constraints (single-domain and mixed-domain) over all three
   // signal domains.

@@ -668,6 +668,12 @@ LogicalResult HandshakePlaceBuffersPass::solveBufferPlacementMILP(
 
     LLVM_DEBUG(logCFDFCUnions(info, disjointUnions););
 
+    // Build a circuit-wide valid/ready dependency graph.
+    buffer::DependencyGraph depGraph;
+    buffer::buildDependencyGraph(info.funcOp, depGraph);
+    buffer::SignalGraph sigGraph;
+    buffer::buildSignalGraph(depGraph, sigGraph);
+
     // Create and solve an MILP for each CFDFC union. Placement decisions get
     // accumulated over all MILPs. It's not possible to override a previous
     // placement decision because each CFDFC union is disjoint from the others
@@ -676,13 +682,9 @@ LogicalResult HandshakePlaceBuffersPass::solveBufferPlacementMILP(
         writeTo = dumpDir + sep + funcName + "-cfunion" + std::to_string(idx);
       }
       fpl22::CFDFCUnionBuffers milp(solverKind, timeout, info, timingDB,
-                                    targetCP, cfUnion, writeTo);
+                                    targetCP, cfUnion, depGraph, writeTo);
       if (failed(milp.solve(placement, calculatePathDelays)))
         return failure();
-    }
-
-    if (dumpMILPModels) {
-      writeTo = dumpDir + sep + funcName + "-out-of-cycle";
     }
 
     // Solve global MILP, viewing all channels/units
@@ -690,7 +692,7 @@ LogicalResult HandshakePlaceBuffersPass::solveBufferPlacementMILP(
       writeTo = dumpDir + sep + funcName + "-global";
     }
     fpl22::NonCFDFCBuffers globalMILP(
-        solverKind, timeout, info, timingDB, targetCP, placement,
+        solverKind, timeout, info, timingDB, targetCP, sigGraph, placement,
         writeTo);
     if (failed(globalMILP.solve(placement, calculatePathDelays)))
       return failure();
